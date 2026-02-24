@@ -6,7 +6,9 @@ import uuid
 import redis
 
 from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
+from flask import Flask, jsonify, abort, Response, g
+
+from time import perf_counter
 
 DB_ERROR_STR = "DB error"
 
@@ -18,6 +20,15 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
 
+@app.before_request
+def start_timer():
+    g.start_time = perf_counter()
+
+@app.after_request
+def log_response(response):
+    duration = perf_counter() - g.start_time
+    print(f"PAYMENT: Request took {duration:.7f} seconds")
+    return response
 
 def close_db_connection():
     db.close()

@@ -9,3 +9,5 @@ RUN pip install -r requirements.txt
 COPY . .
 
 EXPOSE 5000
+
+ENV PYTHONUNBUFFERED=1

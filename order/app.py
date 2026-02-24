@@ -9,7 +9,9 @@ import redis
 import requests
 
 from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
+from flask import Flask, jsonify, abort, Response, g
+
+from time import perf_counter
 
 
 DB_ERROR_STR = "DB error"
@@ -23,6 +25,16 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
+
+@app.before_request
+def start_timer():
+    g.start_time = perf_counter()
+
+@app.after_request
+def log_response(response):
+    duration = perf_counter() - g.start_time
+    print(f"ORDER: Request took {duration:.7f} seconds")
+    return response
 
 
 def close_db_connection():
@@ -107,7 +119,10 @@ def find_order(order_id: str):
 
 def send_post_request(url: str):
     try:
+        start_time = perf_counter()
         response = requests.post(url)
+        duration = perf_counter() - start_time
+        print(f"ORDER: POST request took {duration:.7f} seconds")
     except requests.exceptions.RequestException:
         abort(400, REQ_ERROR_STR)
     else:
@@ -116,7 +131,10 @@ def send_post_request(url: str):
 
 def send_get_request(url: str):
     try:
+        start_time = perf_counter()
         response = requests.get(url)
+        duration = perf_counter() - start_time
+        print(f"ORDER: GET request took {duration:.7f} seconds")
     except requests.exceptions.RequestException:
         abort(400, REQ_ERROR_STR)
     else:
