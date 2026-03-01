@@ -12,6 +12,15 @@ services:
       - stock-service
       - payment-service
 
+  order-db:
+    image: postgres:17-bookworm
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=order
+    command: ["postgres", "-c", "max_prepared_transactions=100"]
+    volumes:
+      - order_data:/var/lib/postgresql/data
+
   order-service:
     build: ./order
     image: order:latest
@@ -19,36 +28,49 @@ services:
       - GATEWAY_URL=http://gateway:80
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
-      - env/order_redis.env
+      - env/order_postgres.env
     depends_on:
       - order-db
 
-  order-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+  stock-db:
+    image: postgres:17-bookworm
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=stock_db
+    command: ["postgres", "-c", "max_prepared_transactions=100"]
+    volumes:
+      - stock_data:/var/lib/postgresql/data
 
   stock-service:
     build: ./stock
     image: stock:latest
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
-      - env/stock_redis.env
+      - env/stock_postgres.env
     depends_on:
       - stock-db
 
-  stock-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+  # --- PAYMENT MICROSERVICE ---
+  payment-db:
+    image: postgres:17-bookworm
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=payment_db
+    command: ["postgres", "-c", "max_prepared_transactions=100"]
+    volumes:
+      - payment_data:/var/lib/postgresql/data
 
   payment-service:
     build: ./payment
-    image: user:latest
+    image: payment:latest
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
-      - env/payment_redis.env
+      - env/payment_postgres.env
     depends_on:
       - payment-db
 
-  payment-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+
+volumes:
+  order_data:
+  stock_data:
+  payment_data:
