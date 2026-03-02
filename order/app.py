@@ -8,6 +8,10 @@ from psycopg2.extras import RealDictCursor
 from flask import Flask, jsonify, abort, Response
 import requests
 
+import grpc
+import transaction_pb2
+import transaction_pb2_grpc
+
 # Constants
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -64,6 +68,9 @@ def init_db():
 
 with app.app_context():
     init_db()
+
+
+
 
 # --- HELPER FUNCTIONS ---
 
@@ -187,6 +194,82 @@ def checkout(order_id: str):
         conn.commit()
         
         return Response("Checkout successful", status=200)
+    finally:
+        release_db_conn(conn)
+
+
+
+# ... existing imports and DB setup ...
+
+def get_stub(service_name):
+    channel = grpc.insecure_channel(f"{service_name}:50051")
+    return transaction_pb2_grpc.TransactionParticipantStub(channel)
+
+@app.post('/2pc/checkout/<order_id>')
+def safe_checkout(order_id: str):
+    # 1. Fetch order details from local Postgres
+    conn = get_db_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+            order = cur.fetchone()
+            if not order or order['paid']:
+                return abort(400, "Invalid order or already paid")
+
+            cur.execute("SELECT item_id, quantity FROM order_items WHERE order_id = %s", (order_id,))
+            items = cur.fetchall()
+            
+        tx_id = f"tx_{order_id}"
+        
+        # 2. Prepare gRPC request
+        grpc_items = [transaction_pb2.OrderItem(item_id=i['item_id'], quantity=i['quantity']) for i in items]
+        prepare_req = transaction_pb2.PrepareRequest(
+            transaction_id=tx_id,
+            user_id=order['user_id'],
+            order_id=order_id,
+            total_cost=order['total_cost'],
+            items=grpc_items
+        )
+
+        # 3. PHASE 1: PREPARE (External Participants + Local)
+        stubs = {
+            "stock": get_stub("stock-service"),
+            "payment": get_stub("payment-service")
+        }
+
+        # Step A: Prepare Stock and Payment
+        success_stock = stubs["stock"].Prepare(prepare_req).success
+        success_payment = stubs["payment"].Prepare(prepare_req).success
+        
+        # Step B: Prepare Local (Order)
+        success_order = False
+        with conn.cursor() as cur:
+            cur.execute("UPDATE orders SET paid = TRUE WHERE order_id = %s", (order_id,))
+            cur.execute(f"PREPARE TRANSACTION '{tx_id}'")
+            success_order = True
+        conn.commit()
+
+        # 4. PHASE 2: GLOBAL DECISION
+        if success_stock and success_payment and success_order:
+            # COMMIT ALL
+            stubs["stock"].Commit(transaction_pb2.CommitRequest(transaction_id=tx_id))
+            stubs["payment"].Commit(transaction_pb2.CommitRequest(transaction_id=tx_id))
+            with conn.cursor() as cur:
+                cur.execute(f"COMMIT PREPARED '{tx_id}'")
+            conn.commit()
+            return Response("Checkout Successful", status=200)
+        else:
+            # ROLLBACK ALL
+            raise Exception("Prepare phase failed")
+
+    except Exception as e:
+        # Global Rollback
+        stubs["stock"].Rollback(transaction_pb2.RollbackRequest(transaction_id=tx_id))
+        stubs["payment"].Rollback(transaction_pb2.RollbackRequest(transaction_id=tx_id))
+        with conn.cursor() as cur:
+            cur.execute(f"ROLLBACK PREPARED '{tx_id}'")
+        conn.commit()
+        return abort(400, f"Checkout failed: {str(e)}")
     finally:
         release_db_conn(conn)
 

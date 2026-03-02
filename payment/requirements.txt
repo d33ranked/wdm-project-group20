@@ -1,4 +1,5 @@
 Flask==3.0.2
 psycopg2-binary
 gunicorn==21.2.0
-msgspec==0.18.6
+grpcio>=1.60.0
+grpcio-tools>=1.60.0

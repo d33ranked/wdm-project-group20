@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package transaction;
+
+// The service definition for all 2PC participants
+service TransactionParticipant {
+  // Phase 1: Prepare (Validate logic and run Postgres PREPARE)
+  rpc Prepare(PrepareRequest) returns (PrepareResponse);
+  
+  // Phase 2: Commit (Run Postgres COMMIT PREPARED)
+  rpc Commit(CommitRequest) returns (Empty);
+  
+  // Phase 2: Rollback (Run Postgres ROLLBACK PREPARED)
+  rpc Rollback(RollbackRequest) returns (Empty);
+}
+
+// Represents a single item in the order
+message OrderItem {
+  string item_id = 1;
+  int32 quantity = 2;
+}
+
+// The master request containing everything needed for 2PC
+message PrepareRequest {
+  string transaction_id = 1; // Unique ID for Postgres PREPARE
+  string user_id = 2;        // Needed for Payment
+  string order_id = 3;       // Needed for Order status
+  int32 total_cost = 4;      // Needed for Payment
+  repeated OrderItem items = 5; // Needed for Stock
+}
+
+message PrepareResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message CommitRequest {
+  string transaction_id = 1;
+}
+
+message RollbackRequest {
+  string transaction_id = 1;
+}
+
+message Empty {}

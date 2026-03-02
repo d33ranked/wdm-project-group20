@@ -22,7 +22,9 @@ services:
       - order_data:/var/lib/postgresql/data
 
   order-service:
-    build: ./order
+    build:
+      context: .
+      dockerfile: ./order/Dockerfile
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
@@ -42,7 +44,9 @@ services:
       - stock_data:/var/lib/postgresql/data
 
   stock-service:
-    build: ./stock
+    build:
+      context: .
+      dockerfile: ./stock/Dockerfile
     image: stock:latest
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
@@ -61,7 +65,9 @@ services:
       - payment_data:/var/lib/postgresql/data
 
   payment-service:
-    build: ./payment
+    build:
+      context: .
+      dockerfile: ./payment/Dockerfile
     image: payment:latest
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:

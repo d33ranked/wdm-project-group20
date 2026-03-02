@@ -59,6 +59,9 @@ def find_order(order_id: str) -> dict:
 def checkout_order(order_id: str) -> requests.Response:
     return requests.post(f"{ORDER_URL}/orders/checkout/{order_id}")
 
+def safe_checkout_order(order_id: str) -> requests.Response:
+    return requests.post(f"{ORDER_URL}/orders/2pc/checkout/{order_id}")
+
 
 ########################################################################################################################
 #   STATUS CHECKS
