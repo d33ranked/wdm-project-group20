@@ -1,6 +1,4 @@
-version: "3"
 services:
-
   gateway:
     image: nginx:1.25-bookworm
     volumes:
