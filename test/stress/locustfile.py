@@ -5,11 +5,13 @@ import requests
 import random
 from dataclasses import dataclass
 
+
 @dataclass
 class Product:
     id: str
     name: str
     price: int
+
 
 class HelloWorldUser(HttpUser):
     @task
@@ -20,14 +22,16 @@ class HelloWorldUser(HttpUser):
 
         for _ in range(n_products):
             prod = random.choice(products)
-            quantity = random.randint(1,20)
+            quantity = random.randint(1, 20)
             self.client.post(f"/orders/addItem/{order_id}/{prod.id}/{quantity}")
 
         self.client.post(f"/orders/checkout/{order_id}")
 
     def on_start(self):
         # Create the user
-        self.uid = self.client.post("/payment/create_user", catch_response=True).json()["user_id"]
+        self.uid = self.client.post("/payment/create_user", catch_response=True).json()[
+            "user_id"
+        ]
 
         # Add funds
         amount = random.randint(50, 500)
@@ -48,10 +52,12 @@ class HelloWorldUser(HttpUser):
 
         for p in products:
             # TODO find another way without harcoding the url here
-            p.id = requests.post(f"http://localhost:8000/stock/item/create/{p.price}").json()["item_id"]
+            p.id = requests.post(
+                f"http://localhost:8000/stock/item/create/{p.price}"
+            ).json()["item_id"]
 
             # Add random amount to the stock
             amount = random.randint(200, 1000)
             requests.post(f"http://localhost:8000/stock/add/{p.id}/{amount}")
 
-        print (products)
+        print(products)

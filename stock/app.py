@@ -14,22 +14,25 @@ DB_ERROR_STR = "DB error"
 
 app = Flask("stock-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
-
+db: redis.Redis = redis.Redis(
+    host=os.environ["REDIS_HOST"],
+    port=int(os.environ["REDIS_PORT"]),
+    password=os.environ["REDIS_PASSWORD"],
+    db=int(os.environ["REDIS_DB"]),
+)
 
 
 @app.before_request
 def start_timer():
     g.start_time = perf_counter()
 
+
 @app.after_request
 def log_response(response):
     duration = perf_counter() - g.start_time
     print(f"STOCK: Request took {duration:.7f} seconds")
     return response
+
 
 def close_db_connection():
     db.close()
@@ -57,7 +60,7 @@ def get_item_from_db(item_id: str) -> StockValue | None:
     return entry
 
 
-@app.post('/item/create/<price>')
+@app.post("/item/create/<price>")
 def create_item(price: int):
     key = str(uuid.uuid4())
     app.logger.debug(f"Item: {key} created")
@@ -66,16 +69,18 @@ def create_item(price: int):
         db.set(key, value)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return jsonify({'item_id': key})
+    return jsonify({"item_id": key})
 
 
-@app.post('/batch_init/<n>/<starting_stock>/<item_price>')
+@app.post("/batch_init/<n>/<starting_stock>/<item_price>")
 def batch_init_users(n: int, starting_stock: int, item_price: int):
     n = int(n)
     starting_stock = int(starting_stock)
     item_price = int(item_price)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
-                                  for i in range(n)}
+    kv_pairs: dict[str, bytes] = {
+        f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
+        for i in range(n)
+    }
     try:
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
@@ -83,18 +88,13 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
     return jsonify({"msg": "Batch init for stock successful"})
 
 
-@app.get('/find/<item_id>')
+@app.get("/find/<item_id>")
 def find_item(item_id: str):
     item_entry: StockValue = get_item_from_db(item_id)
-    return jsonify(
-        {
-            "stock": item_entry.stock,
-            "price": item_entry.price
-        }
-    )
+    return jsonify({"stock": item_entry.stock, "price": item_entry.price})
 
 
-@app.post('/add/<item_id>/<amount>')
+@app.post("/add/<item_id>/<amount>")
 def add_stock(item_id: str, amount: int):
     item_entry: StockValue = get_item_from_db(item_id)
     # update stock, serialize and update database
@@ -106,7 +106,7 @@ def add_stock(item_id: str, amount: int):
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
 
-@app.post('/subtract/<item_id>/<amount>')
+@app.post("/subtract/<item_id>/<amount>")
 def remove_stock(item_id: str, amount: int):
     item_entry: StockValue = get_item_from_db(item_id)
     # update stock, serialize and update database
@@ -121,9 +121,9 @@ def remove_stock(item_id: str, amount: int):
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
+    gunicorn_logger = logging.getLogger("gunicorn.error")
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
