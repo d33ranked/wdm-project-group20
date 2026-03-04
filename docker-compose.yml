@@ -57,6 +57,8 @@ services:
   payment-service:
     build: ./payment
     image: payment:latest
+    ports:
+      - "5001:5000"
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app

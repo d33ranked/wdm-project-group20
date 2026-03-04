@@ -1,8 +1,8 @@
 import os
+import time
 import uuid
 import atexit
 import logging
-import time
 
 import psycopg2
 import psycopg2.pool
@@ -28,7 +28,9 @@ def create_conn_pool(retries=10, delay=2):
             )
         except psycopg2.OperationalError:
             if attempt < retries - 1:
-                print(f"STOCK: PostgreSQL not ready, retrying in {delay}s... (attempt {attempt+1}/{retries})")
+                print(
+                    f"STOCK: PostgreSQL not ready, retrying in {delay}s... (attempt {attempt+1}/{retries})"
+                )
                 time.sleep(delay)
             else:
                 raise
