@@ -1,0 +1,7 @@
+CREATE TABLE IF NOT EXISTS orders (
+    id TEXT PRIMARY KEY,
+    paid BOOLEAN NOT NULL DEFAULT FALSE,
+    items JSONB NOT NULL DEFAULT '[]',
+    user_id TEXT NOT NULL,
+    total_cost INTEGER NOT NULL DEFAULT 0
+);
