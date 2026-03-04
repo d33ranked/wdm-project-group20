@@ -4,8 +4,9 @@ import atexit
 import uuid
 import psycopg2
 from psycopg2 import pool
-from psycopg2.extras import RealDictCursor
-from flask import Flask, jsonify, abort, Response
+from psycopg2.extras import RealDictCursor, execute_values
+from flask import Flask, jsonify, abort, Response, g
+from time import perf_counter
 
 DB_ERROR_STR = "DB error"
 
@@ -29,6 +30,16 @@ except Exception as e:
 def get_db_conn():
     return db_pool.getconn()
 
+@app.before_request
+def start_timer():
+    g.start_time = perf_counter()
+
+@app.after_request
+def log_response(response):
+    duration = perf_counter() - g.start_time
+    print(f"STOCK: Request took {duration:.7f} seconds")
+    return response
+
 def release_db_conn(conn):
     db_pool.putconn(conn)
 
@@ -38,16 +49,24 @@ def close_db_pool():
 
 def init_db():
     conn = get_db_conn()
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS stock (
-                item_id TEXT PRIMARY KEY,
-                stock_count INTEGER NOT NULL DEFAULT 0,
-                price INTEGER NOT NULL DEFAULT 0
-            );
-        """)
-    conn.commit()
-    release_db_conn(conn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS stock (
+                    item_id TEXT PRIMARY KEY,
+                    stock_count INTEGER NOT NULL DEFAULT 0,
+                    price INTEGER NOT NULL DEFAULT 0
+                );
+            """)
+        conn.commit()
+    except psycopg2.errors.UniqueViolation:
+        # Table already exists (race condition with other workers), ignore
+        conn.rollback()
+    except Exception as e:
+        conn.rollback()
+        app.logger.warning(f"init_db error (may be harmless): {e}")
+    finally:
+        release_db_conn(conn)
 
 with app.app_context():
     init_db()
@@ -78,15 +97,19 @@ def batch_init(n: int, starting_stock: int, item_price: int):
     try:
         with conn.cursor() as cur:
             data = [(str(i), int(starting_stock), int(item_price)) for i in range(int(n))]
-            cur.executemany(
-                "INSERT INTO stock (item_id, stock_count, price) VALUES (%s, %s, %s) "
+            # Use execute_values for much faster bulk insert
+            execute_values(
+                cur,
+                "INSERT INTO stock (item_id, stock_count, price) VALUES %s "
                 "ON CONFLICT (item_id) DO UPDATE SET stock_count = EXCLUDED.stock_count, price = EXCLUDED.price",
-                data
+                data,
+                page_size=10000
             )
         conn.commit()
         return jsonify({"msg": "Batch init for stock successful"})
-    except Exception:
+    except Exception as e:
         conn.rollback()
+        print(f"STOCK batch_init error: {str(e)}")
         abort(400, DB_ERROR_STR)
     finally:
         release_db_conn(conn)

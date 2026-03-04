@@ -1,18 +1,6 @@
-# Distributed Data Systems Project Template
+# Distributed Data Systems Project Group 20
 
-Basic project structure with Python's Flask and Redis. 
-**You are free to use any web framework in any language and any database you like for this project.**
-
-### Project structure
-
-* `env`
-    Folder containing the Redis env variables for the docker-compose deployment
-    
-* `helm-config` 
-   Helm chart values for Redis and ingress-nginx
-        
-* `k8s`
-    Folder containing the kubernetes deployments, apps and services for the ingress, order, payment and stock services.
+## Project structure
     
 * `order`
     Folder containing the order application logic and dockerfile. 
@@ -26,28 +14,71 @@ Basic project structure with Python's Flask and Redis.
 * `test`
     Folder containing some basic correctness tests for the entire system. (Feel free to enhance them)
 
-### Deployment types:
-
-#### docker-compose (local development)
-
-After coding the REST endpoint logic run `docker-compose up --build` in the base folder to test if your logic is correct
-(you can use the provided tests in the `\test` folder and change them as you wish). 
+## Deployment
 
 ***Requirements:*** You need to have docker and docker-compose installed on your machine. 
 
-K8s is also possible, but we do not require it as part of your submission. 
+In the root of the project, run `docker-compose up`, or `docker-compose up --build` if you changed anything and need to rebuild the containers.
 
-#### minikube (local k8s cluster)
+You can stop the deployment with `docker-compose down` or via Docker Desktop's UI.
 
-This setup is for local k8s testing to see if your k8s config works before deploying to the cloud. 
-First deploy your database using helm by running the `deploy-charts-minicube.sh` file (in this example the DB is Redis 
-but you can find any database you want in https://artifacthub.io/ and adapt the script). Then adapt the k8s configuration files in the
-`\k8s` folder to mach your system and then run `kubectl apply -f .` in the k8s folder. 
+## Testing
 
-***Requirements:*** You need to have minikube (with ingress enabled) and helm installed on your machine.
+***Requirements:*** Python >=3.10 
 
-#### kubernetes cluster (managed k8s cluster in the cloud)
+Make a Python environment with the required packages:
+```sh
+python -m venv venv
 
-Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in the helm step to also install an ingress to the cluster. 
+# Activate with
+source venv/bin/activate 
+# Or on Windows:
+.\venv\Scripts\Activate.ps1 
 
-***Requirements:*** You need to have access to kubectl of a k8s cluster.
+pip install -r requirements.txt
+
+# You can deactivate with:
+deactivate
+```
+
+Deploy the project:
+```
+docker-compose up
+```
+
+### Benchmarking
+Use the [provided benchmarking repo](https://github.com/delftdata/wdm-project-benchmark/tree/master). There are good instructions there, but in short:
+
+```sh
+git clone https://github.com/delftdata/wdm-project-benchmark.git
+cd wdm-project-benchmark
+python -m venv venv
+# Activate with
+source venv/bin/activate 
+# Or on Windows:
+.\venv\Scripts\Activate.ps1 
+pip install -r requirements.txt
+```
+
+Then, check for consistency correctness with:
+```sh
+cd consistency-test
+python run_consistency_test.py
+```
+
+Stress test with:
+```
+cd stress-test
+python init_orders.py
+locust -f locustfile.py --host="localhost"
+```
+Go to [http://localhost:8089/](http://localhost:8089/) to use the Locust UI. Set the number of users and the Ramp up, then press Start.
+
+### Our Own Locust Testing
+
+We use locust to do stress testing. To run these tests, follow these instructions:
+
+- Run the project as usual with `docker-compose up --build`.
+- Navigate to `cd test/stress`.
+- Run locust: `locust -f locustfile.py --host="localhost"`.
+- Locust will give you a URL where you can run the tests based on the locustfile that it found in the directory.

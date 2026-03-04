@@ -4,9 +4,10 @@ import atexit
 import uuid
 import psycopg2
 from psycopg2 import pool
-from psycopg2.extras import RealDictCursor
-from flask import Flask, jsonify, abort, Response
+from psycopg2.extras import RealDictCursor, execute_values
+from flask import Flask, jsonify, abort, Response, g
 import requests
+from time import perf_counter
 
 FLAG_2PC = os.environ.get('ENABLE_2PC', "false") == "true"
 FLAG_gRPC = os.environ.get('ENABLE_GRPC', "false") == "true"
@@ -15,7 +16,6 @@ if FLAG_2PC or FLAG_gRPC:
     import grpc
     import transaction_pb2
     import transaction_pb2_grpc
-
 
 
 DB_ERROR_STR = "DB error"
@@ -52,26 +52,44 @@ def close_db_pool():
 
 def init_db():
     conn = get_db_conn()
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS orders (
-                order_id UUID PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                paid BOOLEAN DEFAULT FALSE,
-                total_cost BIGINT DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS order_items (
-                order_id UUID REFERENCES orders(order_id) ON DELETE CASCADE,
-                item_id TEXT NOT NULL,
-                quantity INTEGER NOT NULL,
-                PRIMARY KEY (order_id, item_id)
-            );
-        """)
-    conn.commit()
-    release_db_conn(conn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS orders (
+                    order_id UUID PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    paid BOOLEAN DEFAULT FALSE,
+                    total_cost BIGINT DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS order_items (
+                    order_id UUID REFERENCES orders(order_id) ON DELETE CASCADE,
+                    item_id TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    PRIMARY KEY (order_id, item_id)
+                );
+            """)
+        conn.commit()
+    except psycopg2.errors.UniqueViolation:
+        # Table already exists (race condition with other workers), ignore
+        conn.rollback()
+    except Exception as e:
+        conn.rollback()
+        app.logger.warning(f"init_db error (may be harmless): {e}")
+    finally:
+        release_db_conn(conn)
 
 with app.app_context():
     init_db()
+
+@app.before_request
+def start_timer():
+    g.start_time = perf_counter()
+
+@app.after_request
+def log_response(response):
+    duration = perf_counter() - g.start_time
+    print(f"ORDER: Request took {duration:.7f} seconds")
+    return response
 
 
 
@@ -104,6 +122,75 @@ def create_order(user_id: str):
     finally:
         release_db_conn(conn)
     return jsonify({'order_id': order_id})
+
+@app.post('/batch_init/<num_orders>/<num_items>/<num_users>/<item_price>')
+def batch_init_orders(num_orders: int, num_items: int, num_users: int, item_price: int):
+    """Create orders in bulk. Creates random orders with random items."""
+    import random
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Create orders with random user IDs and items
+            orders_data = []
+            order_costs = {}  # Track total cost per order
+            for i in range(int(num_orders)):
+                order_id = str(uuid.uuid4())
+                user_id = str(random.randint(0, int(num_users) - 1))
+                orders_data.append((order_id, user_id))
+                order_costs[order_id] = 0
+            
+            # Use execute_values for much faster bulk insert
+            execute_values(
+                cur,
+                "INSERT INTO orders (order_id, user_id) VALUES %s ON CONFLICT (order_id) DO NOTHING",
+                orders_data,
+                page_size=10000
+            )
+            
+            # Add random items to orders - use dict to aggregate duplicates
+            items_dict = {}  # (order_id, item_id) -> quantity
+            for order_id, _ in orders_data:
+                num_items_in_order = random.randint(1, 5)
+                for _ in range(num_items_in_order):
+                    item_id = str(random.randint(0, int(num_items) - 1))
+                    quantity = random.randint(1, 10)
+                    price = int(item_price)
+                    total_cost = quantity * price
+                    
+                    # Aggregate duplicate (order_id, item_id) pairs
+                    key = (order_id, item_id)
+                    if key in items_dict:
+                        items_dict[key] += quantity
+                    else:
+                        items_dict[key] = quantity
+                    order_costs[order_id] += total_cost
+            
+            # Convert to list of tuples
+            items_data = [(order_id, item_id, qty) for (order_id, item_id), qty in items_dict.items()]
+            
+            if items_data:
+                execute_values(
+                    cur,
+                    "INSERT INTO order_items (order_id, item_id, quantity) VALUES %s ON CONFLICT (order_id, item_id) DO UPDATE SET quantity = order_items.quantity + EXCLUDED.quantity",
+                    items_data,
+                    page_size=10000
+                )
+            
+            # Batch update total costs
+            cost_updates = [(cost, order_id) for order_id, cost in order_costs.items()]
+            cur.executemany(
+                "UPDATE orders SET total_cost = total_cost + %s WHERE order_id = %s",
+                cost_updates
+            )
+        
+        conn.commit()
+        return jsonify({"msg": "Batch init for orders successful"})
+    except Exception as e:
+        conn.rollback()
+        print(f"ORDER batch_init error: {str(e)}")
+        abort(400, DB_ERROR_STR)
+    finally:
+        release_db_conn(conn)
 
 @app.get('/find/<order_id>')
 def find_order(order_id: str):
