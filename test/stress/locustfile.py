@@ -16,26 +16,24 @@ class Product:
 class HelloWorldUser(HttpUser):
     @task
     def user_full_checkout(self):
-        order_id = self.client.post(f"/orders/create/{self.uid}").json()["order_id"]
+        order_id = self.client.post(f"http://localhost:8000/orders/create/{self.uid}").json()["order_id"]
 
         n_products = random.randint(1, 10)
 
         for _ in range(n_products):
             prod = random.choice(products)
-            quantity = random.randint(1, 20)
-            self.client.post(f"/orders/addItem/{order_id}/{prod.id}/{quantity}")
+            quantity = random.randint(1,20)
+            self.client.post(f"http://localhost:8000/orders/addItem/{order_id}/{prod.id}/{quantity}")
 
-        self.client.post(f"/orders/checkout/{order_id}")
+        self.client.post(f"http://localhost:8000/orders/checkout/{order_id}")
 
     def on_start(self):
         # Create the user
-        self.uid = self.client.post("/payment/create_user", catch_response=True).json()[
-            "user_id"
-        ]
+        self.uid = self.client.post("http://localhost:8000/payment/create_user", catch_response=True).json()["user_id"]
 
         # Add funds
         amount = random.randint(50, 500)
-        self.client.post(f"/payment/add_funds/{self.uid}/{amount}")
+        self.client.post(f"http://localhost:8000/payment/add_funds/{self.uid}/{amount}")
 
     @events.test_start.add_listener
     def on_test_start(environment, **kwargs):
