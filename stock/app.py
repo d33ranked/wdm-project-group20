@@ -117,6 +117,12 @@ def find_item(item_id: str):
 
 @app.post("/add/<item_id>/<amount>")
 def add_stock(item_id: str, amount: int):
+    # check idempotency key
+    cached = check_idempotency()
+    if cached is not None:
+        return cached
+
+    # add stock
     cur = g.conn.cursor()
     cur.execute("SELECT stock FROM items WHERE id = %s FOR UPDATE", (item_id,))
     row = cur.fetchone()
@@ -129,11 +135,21 @@ def add_stock(item_id: str, amount: int):
     )
     new_stock = cur.fetchone()[0]
     cur.close()
-    return Response(f"Item: {item_id} stock updated to: {new_stock}", status=200)
+
+    # save idempotency key
+    body = f"Item: {item_id} stock updated to: {new_stock}"
+    save_idempotency(200, body)
+    return Response(body, status=200)
 
 
 @app.post("/subtract/<item_id>/<amount>")
 def remove_stock(item_id: str, amount: int):
+    # check idempotency key
+    cached = check_idempotency()
+    if cached is not None:
+        return cached
+
+    # subtract stock
     cur = g.conn.cursor()
     cur.execute("SELECT stock FROM items WHERE id = %s FOR UPDATE", (item_id,))
     row = cur.fetchone()
@@ -150,7 +166,11 @@ def remove_stock(item_id: str, amount: int):
     )
     new_stock = cur.fetchone()[0]
     cur.close()
-    return Response(f"Item: {item_id} stock updated to: {new_stock}", status=200)
+
+    # save idempotency key
+    body = f"Item: {item_id} stock updated to: {new_stock}"
+    save_idempotency(200, body)
+    return Response(body, status=200)
 
 
 def check_idempotency():

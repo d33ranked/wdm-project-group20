@@ -114,6 +114,12 @@ def find_user(user_id: str):
 
 @app.post("/add_funds/<user_id>/<amount>")
 def add_credit(user_id: str, amount: int):
+    # check idempotency key
+    cached = check_idempotency()
+    if cached is not None:
+        return cached
+
+    # add credit
     cur = g.conn.cursor()
     cur.execute("SELECT credit FROM users WHERE id = %s FOR UPDATE", (user_id,))
     row = cur.fetchone()
@@ -126,11 +132,21 @@ def add_credit(user_id: str, amount: int):
     )
     new_credit = cur.fetchone()[0]
     cur.close()
-    return Response(f"User: {user_id} credit updated to: {new_credit}", status=200)
+
+    # save idempotency key
+    body = f"User: {user_id} credit updated to: {new_credit}"
+    save_idempotency(200, body)
+    return Response(body, status=200)
 
 
 @app.post("/pay/<user_id>/<amount>")
 def remove_credit(user_id: str, amount: int):
+    # check idempotency key
+    cached = check_idempotency()
+    if cached is not None:
+        return cached
+
+    # remove credit
     cur = g.conn.cursor()
     cur.execute("SELECT credit FROM users WHERE id = %s FOR UPDATE", (user_id,))
     row = cur.fetchone()
@@ -147,7 +163,11 @@ def remove_credit(user_id: str, amount: int):
     )
     new_credit = cur.fetchone()[0]
     cur.close()
-    return Response(f"User: {user_id} credit updated to: {new_credit}", status=200)
+
+    # save idempotency key
+    body = f"User: {user_id} credit updated to: {new_credit}"
+    save_idempotency(200, body)
+    return Response(body, status=200)
 
 
 def check_idempotency():
