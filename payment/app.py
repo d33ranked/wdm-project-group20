@@ -8,7 +8,7 @@ import psycopg2
 import psycopg2.pool
 
 from time import perf_counter
-from flask import Flask, jsonify, abort, Response, g
+from flask import Flask, jsonify, abort, request, Response, g
 
 
 DB_ERROR_STR = "DB error"
@@ -148,6 +148,35 @@ def remove_credit(user_id: str, amount: int):
     new_credit = cur.fetchone()[0]
     cur.close()
     return Response(f"User: {user_id} credit updated to: {new_credit}", status=200)
+
+
+def check_idempotency():
+    """Check if this request was already processed. Returns the key and status code or None."""
+    idem_key = request.headers.get("Idempotency-Key")
+    if not idem_key:
+        return None
+    cur = g.conn.cursor()
+    cur.execute(
+        "SELECT status_code, body FROM idempotency_keys WHERE key = %s", (idem_key,)
+    )
+    row = cur.fetchone()
+    cur.close()
+    if row is not None:
+        return Response(row[1], status=row[0])
+    return None
+
+
+def save_idempotency(status_code, body):
+    """Save the result so future calls with the same key return this result."""
+    idem_key = request.headers.get("Idempotency-Key")
+    if not idem_key:
+        return
+    cur = g.conn.cursor()
+    cur.execute(
+        "INSERT INTO idempotency_keys (key, status_code, body) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+        (idem_key, status_code, body),
+    )
+    cur.close()
 
 
 if __name__ == "__main__":
