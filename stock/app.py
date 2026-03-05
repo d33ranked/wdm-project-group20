@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 import atexit
+import hashlib
 import logging
 
 import psycopg2
@@ -173,12 +174,18 @@ def remove_stock(item_id: str, amount: int):
     return Response(body, status=200)
 
 
+# generate advisory lock id from idempotency key
+def idempotency_token(key: str) -> int:
+    return int(hashlib.md5(key.encode()).hexdigest(), 16) % (2**31)
+
+
 def check_idempotency():
-    """Check if this request was already processed. Returns the key and status code or None."""
+    # check if this request was already processed. returns the cached response or None.
     idem_key = request.headers.get("Idempotency-Key")
     if not idem_key:
         return None
     cur = g.conn.cursor()
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (idempotency_token(idem_key),))
     cur.execute(
         "SELECT status_code, body FROM idempotency_keys WHERE key = %s", (idem_key,)
     )
@@ -190,7 +197,7 @@ def check_idempotency():
 
 
 def save_idempotency(status_code, body):
-    """Save the result so future calls with the same key return this result."""
+    # save the result so future calls with the same key return this result.
     idem_key = request.headers.get("Idempotency-Key")
     if not idem_key:
         return
