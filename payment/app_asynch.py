@@ -185,12 +185,12 @@ def handle_batch_init(conn, path_params, _body, _headers) -> tuple[int, Any]:
     try:
         n              = int(path_params[0])
         starting_money = int(path_params[1])
-
-        if starting_money < 0:
-            return 400, {"error", "Can not start with a negative amount of money"}
-
     except (IndexError, ValueError):
         return 400, {"error": "Expected /batch_init/<n>/<starting_money>"}
+
+    if starting_money < 0:
+        return 400, {"error", "Can not start with a negative amount of money"}
+
     db_batch_init(conn, n, starting_money)
     return 200, {"msg": "Batch init for users successful"}
 
