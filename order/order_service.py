@@ -546,12 +546,12 @@ def route_gateway_message(payload: dict[str, Any], conn) -> tuple[int, Any] | No
     headers["X-Correlation-Id"] = payload.get("correlation_id", "")
 
     segments    = [s for s in path.strip("/").split("/") if s]
-    path_params = segments[1:]
-    clean_path  = "/" + "/".join(segments[1:]) + "/" if len(segments) > 1 else "/"
+    clean_path            = "/" + "/".join(segments) if segments else "/"
+    clean_path_with_slash = clean_path if clean_path.endswith("/") else clean_path + "/"
 
     for route_method, prefix, handler in ROUTES:
-        if method == route_method and clean_path.startswith(prefix):
-            return handler(conn, path_params, body, headers)
+        if method == route_method and clean_path_with_slash.startswith(prefix):
+            return handler(conn, segments, body, headers)
 
     return 404, {"error": f"No handler for {method} {path}"}
 
@@ -804,11 +804,15 @@ def start_health_server() -> None:
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+# Initialised at module level so startup is independent of how the module
+# is loaded — whether via `python order_service.py` or imported by a
+# process supervisor. Producers and consumer threads must be running before
+# any work can be processed.
+gateway_producer  = _build_producer(GATEWAY_KAFKA)
+internal_producer = _build_producer(INTERNAL_KAFKA)
+
+threading.Thread(target=start_internal_consumer, daemon=True, name="internal-consumer").start()
+threading.Thread(target=start_health_server, daemon=True, name="health-server").start()
+
 if __name__ == "__main__":
-    gateway_producer  = _build_producer(GATEWAY_KAFKA)
-    internal_producer = _build_producer(INTERNAL_KAFKA)
-
-    threading.Thread(target=start_internal_consumer, daemon=True, name="internal-consumer").start()
-    threading.Thread(target=start_health_server, daemon=True, name="health-server").start()
-
     start_gateway_consumer()  # blocks on main thread

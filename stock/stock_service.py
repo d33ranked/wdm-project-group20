@@ -14,6 +14,24 @@ Handles traffic from two separate Kafka clusters:
 
 All business logic is shared — the only difference between the two
 consumer loops is which topic they consume and which they reply to.
+
+Deployment
+----------
+This service is NOT a web server and must NOT be run under gunicorn.
+It is a long-running Kafka consumer process. Running multiple gunicorn
+workers would fork multiple processes, each creating its own Kafka
+consumer in the same consumer group — Kafka would then split the topic
+partitions across them, meaning each worker would only see a fraction of
+messages and most requests would go unanswered.
+
+The correct deployment is simply:
+    CMD ["python", "stock_service.py"]
+
+One process, two consumer threads (gateway + internal), one health thread.
+The gateway consumer runs on the main thread and blocks for the lifetime
+of the process. If horizontal scaling is needed, run multiple container
+replicas — Kafka's consumer group protocol will then correctly distribute
+partitions across them.
 """
 
 import atexit
@@ -257,13 +275,10 @@ def handle_batch_init(conn, path_params, _body, _headers) -> tuple[int, Any]:
         item_price     = int(path_params[2])
     except (IndexError, ValueError):
         return 400, {"error": "Expected /batch_init/<n>/<starting_stock>/<item_price>"}
-
     if item_price < 0:
         return 400, {"error": "Price cannot be negative"}
-
     if starting_stock < 0:
-        return 400, {"error": "Starting stock amount can't be negative"}
-
+        return 400, {"error": "Starting stock cannot be negative"}
     db_batch_init(conn, n, starting_stock, item_price)
     return 200, {"msg": "Batch init for stock successful"}
 
@@ -425,22 +440,23 @@ def route(payload: dict[str, Any], conn) -> tuple[int, Any]:
     body    = payload.get("body") or {}
     headers = payload.get("headers") or {}
 
-    segments            = [s for s in path.strip("/").split("/") if s]
-    path_params         = segments[1:]  # drop "stock" service prefix
-    clean_path          = "/" + "/".join(segments[1:]) if len(segments) > 1 else "/"
+    segments              = [s for s in path.strip("/").split("/") if s]
+    clean_path            = "/" + "/".join(segments) if segments else "/"
     clean_path_with_slash = clean_path if clean_path.endswith("/") else clean_path + "/"
+
+    print(f"routing: method: {method}, clean_path: {clean_path_with_slash}, orignal path: {path}, headers: {headers}, segments: {segments}")
 
     for route_method, prefix, handler in ROUTES:
         if method == route_method and clean_path_with_slash.startswith(prefix):
-            # /item/create/<price> has an extra segment before the param
+            # /item/create/<price> has an extra path segment before the param
             if prefix.startswith("/item/"):
-                return handler(conn, path_params[1:], body, headers)
-            return handler(conn, path_params, body, headers)
+                return handler(conn, segments[1:], body, headers)
+            return handler(conn, segments, body, headers)
 
     return 404, {"error": f"No handler for {method} {path}"}
 
 # ---------------------------------------------------------------------------
-# Kafka producers — one per cluster, built at startup
+# Kafka producers — one per cluster
 # ---------------------------------------------------------------------------
 
 def _build_producer(bootstrap_servers: str) -> kafka.KafkaProducer:
@@ -453,10 +469,6 @@ def _build_producer(bootstrap_servers: str) -> kafka.KafkaProducer:
         linger_ms=5,
         batch_size=32_768,
     )
-
-
-gateway_producer: kafka.KafkaProducer | None  = None
-internal_producer: kafka.KafkaProducer | None = None
 
 
 def _publish_response(
@@ -479,6 +491,17 @@ def _publish_response(
 
 # ---------------------------------------------------------------------------
 # Shared consumer logic
+#
+# Both consumer loops (gateway and internal) are identical in structure —
+# they differ only in which Kafka cluster they connect to and which response
+# topic they publish to. _run_consumer is parameterised on these differences
+# so all error handling, offset commit logic, and DB connection management
+# is defined exactly once.
+#
+# Offset commit strategy: manual commit AFTER the response is published.
+# If the process crashes between processing and publishing, Kafka redelivers
+# the message. The idempotency key written atomically with the DB change
+# guarantees the business logic is not executed twice on redelivery.
 # ---------------------------------------------------------------------------
 
 def _run_consumer(
@@ -520,13 +543,13 @@ def _run_consumer(
             conn_pool.putconn(conn)
 
         _publish_response(producer, response_topic, correlation_id, status_code, body)
-
-        # Commit offset only after response is published — on crash and redeliver,
-        # idempotency keys guarantee the DB write is a safe no-op.
         consumer.commit()
 
 # ---------------------------------------------------------------------------
 # Health-check surface
+#
+# A minimal Flask app on a daemon thread. Intentionally separate from the
+# main service — it must never block or interfere with the consumer loops.
 # ---------------------------------------------------------------------------
 
 health_app = Flask("stock-service-health")
@@ -536,36 +559,49 @@ def health():
     return jsonify({"status": "healthy"})
 
 def start_health_server() -> None:
+    # Flask's dev server is sufficient here — this endpoint only needs to
+    # answer a liveness probe, not handle concurrent load.
     health_app.run(host="0.0.0.0", port=8000, debug=False)
 
 # ---------------------------------------------------------------------------
-# Entrypoint
+# Startup
+#
+# Producers and daemon threads are initialised at module level so they start
+# regardless of whether this file is run directly or imported.
+#
+# The gateway consumer call at the bottom blocks forever — it must stay
+# inside `if __name__ == "__main__"` so that importing this module (e.g.
+# during testing) does not immediately start consuming messages.
 # ---------------------------------------------------------------------------
 
+gateway_producer  = _build_producer(GATEWAY_KAFKA)
+internal_producer = _build_producer(INTERNAL_KAFKA)
+
+# Internal consumer — daemon thread so it dies with the main process
+threading.Thread(
+    target=_run_consumer,
+    args=(
+        INTERNAL_KAFKA,
+        INTERNAL_STOCK_TOPIC,
+        "stock-service-internal",
+        internal_producer,
+        INTERNAL_RESPONSE_TOPIC,
+    ),
+    daemon=True,
+    name="internal-consumer",
+).start()
+
+# Health server — daemon thread
+threading.Thread(
+    target=start_health_server,
+    daemon=True,
+    name="health-server",
+).start()
+
 if __name__ == "__main__":
-    gateway_producer  = _build_producer(GATEWAY_KAFKA)
-    internal_producer = _build_producer(INTERNAL_KAFKA)
-
-    threading.Thread(
-        target=_run_consumer,
-        args=(
-            INTERNAL_KAFKA,
-            INTERNAL_STOCK_TOPIC,
-            "stock-service-internal",
-            internal_producer,
-            INTERNAL_RESPONSE_TOPIC,
-        ),
-        daemon=True,
-        name="internal-consumer",
-    ).start()
-
-    threading.Thread(
-        target=start_health_server,
-        daemon=True,
-        name="health-server",
-    ).start()
-
-    # Gateway consumer — main thread
+    # Gateway consumer runs on the main thread and blocks for the lifetime
+    # of the process. When this returns (or raises), the process exits and
+    # all daemon threads are killed cleanly.
     _run_consumer(
         GATEWAY_KAFKA,
         GATEWAY_STOCK_TOPIC,

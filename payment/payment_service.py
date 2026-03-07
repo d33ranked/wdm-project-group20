@@ -285,17 +285,21 @@ ROUTES: list[tuple[str, str, callable]] = [
     ("POST", "/pay/",        handle_pay),
 ]
 
-
 def route(payload: dict[str, Any], conn) -> tuple[int, Any]:
-    method      = payload.get("method", "GET").upper()
-    path        = payload.get("path", "/")
-    body        = payload.get("body") or {}
-    headers     = payload.get("headers") or {}
-    path_params = [s for s in path.strip("/").split("/") if s][1:]  # drop service prefix
+    method  = payload.get("method", "GET").upper()
+    path    = payload.get("path", "/")
+    body    = payload.get("body") or {}
+    headers = payload.get("headers") or {}
+
+    segments              = [s for s in path.strip("/").split("/") if s]
+    clean_path            = "/" + "/".join(segments) if segments else "/"
+    clean_path_with_slash = clean_path if clean_path.endswith("/") else clean_path + "/"
+
+    print(f"routing: method: {method}, clean_path: {clean_path_with_slash}, orignal path: {path}, headers: {headers}, segments: {segments}")
 
     for route_method, prefix, handler in ROUTES:
-        if method == route_method and path.startswith(prefix):
-            return handler(conn, path_params, body, headers)
+        if method == route_method and clean_path_with_slash.startswith(prefix):
+            return handler(conn, segments, body, headers)
 
     return 404, {"error": f"No handler for {method} {path}"}
 
@@ -404,30 +408,30 @@ def start_health_server() -> None:
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
+gateway_producer  = _build_producer(GATEWAY_KAFKA)
+internal_producer = _build_producer(INTERNAL_KAFKA)
+
+# Internal consumer — daemon thread (internal Kafka cluster)
+threading.Thread(
+    target=_run_consumer,
+    args=(
+        INTERNAL_KAFKA,
+        INTERNAL_PAYMENT_TOPIC,
+        "payment-service-internal",
+        internal_producer,
+        INTERNAL_RESPONSE_TOPIC,
+    ),
+    daemon=True,
+    name="internal-consumer",
+).start()
+
+threading.Thread(
+    target=start_health_server,
+    daemon=True,
+    name="health-server",
+).start()
 
 if __name__ == "__main__":
-    gateway_producer  = _build_producer(GATEWAY_KAFKA)
-    internal_producer = _build_producer(INTERNAL_KAFKA)
-
-    # Internal consumer — daemon thread (internal Kafka cluster)
-    threading.Thread(
-        target=_run_consumer,
-        args=(
-            INTERNAL_KAFKA,
-            INTERNAL_PAYMENT_TOPIC,
-            "payment-service-internal",
-            internal_producer,
-            INTERNAL_RESPONSE_TOPIC,
-        ),
-        daemon=True,
-        name="internal-consumer",
-    ).start()
-
-    threading.Thread(
-        target=start_health_server,
-        daemon=True,
-        name="health-server",
-    ).start()
 
     # Gateway consumer — main thread
     _run_consumer(

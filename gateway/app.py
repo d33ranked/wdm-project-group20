@@ -280,7 +280,7 @@ class KafkaClient:
 # Flask proxy routes
 # ---------------------------------------------------------------------------
 
-def _proxy(service_topic: str, subpath: str) -> Response:
+def _proxy(service_topic: str, subpath: str, kafka_client) -> Response:
     """
     Shared handler for all service proxy routes.
 
@@ -351,38 +351,36 @@ METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 @app.route("/orders/", defaults={"subpath": ""}, methods=METHODS)
 @app.route("/orders/<path:subpath>", methods=METHODS)
 def orders_proxy(subpath: str) -> Response:
-    return _proxy("gateway.orders", subpath)
+    return _proxy("gateway.orders", subpath, kafka_client)
 
 
 @app.route("/stock/", defaults={"subpath": ""}, methods=METHODS)
 @app.route("/stock/<path:subpath>", methods=METHODS)
 def stock_proxy(subpath: str) -> Response:
-    return _proxy("gateway.stock", subpath)
+    return _proxy("gateway.stock", subpath, kafka_client)
 
 
 @app.route("/payment/", defaults={"subpath": ""}, methods=METHODS)
 @app.route("/payment/<path:subpath>", methods=METHODS)
 def payment_proxy(subpath: str) -> Response:
-    return _proxy("gateway.payment", subpath)
+    return _proxy("gateway.payment", subpath, kafka_client)
 
 
 @app.route("/health")
 def health() -> Response:
     return jsonify({"status": "healthy"})
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
+# Initialised at module level so this runs whether the app is started via
+# gunicorn (which imports the module directly) or via `python app.py`.
+# If placed inside `if __name__ == "__main__"` it would be skipped by
+# gunicorn and kafka_client would never be set, causing an AttributeError
+# on the first request.
+ensure_topics(
+    KAFKA_BOOTSTRAP_SERVERS,
+    GATEWAY_TOPICS + [RESPONSE_TOPIC],
+)
+
+kafka_client = KafkaClient(KAFKA_BOOTSTRAP_SERVERS)
 
 if __name__ == "__main__":
-    ensure_topics(
-        KAFKA_BOOTSTRAP_SERVERS,
-        GATEWAY_TOPICS + [RESPONSE_TOPIC],
-    )
-
-    # KafkaClient starts its response consumer background thread on init.
-    # It must be initialised before Flask starts accepting requests, otherwise
-    # the first requests have no consumer to receive their responses.
-    kafka_client = KafkaClient(KAFKA_BOOTSTRAP_SERVERS)
-
     app.run(host="0.0.0.0", port=8000, debug=False)
