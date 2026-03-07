@@ -115,16 +115,6 @@ services:
     volumes:
       - kafka_data:/apache/kafka
 
-  kafka-ui:
-    image: provectuslabs/kafka-ui:latest
-    ports:
-      - "8080:8080"
-    depends_on:
-      - kafka
-    environment:
-      - KAFKA_CLUSTERS_0_NAME=local
-      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
-
   kafka-internal:
     image: apache/kafka:latest
     ports:
@@ -147,15 +137,19 @@ services:
     volumes:
       - kafka_internal_data:/apache/kafka
 
-  kafka-ui-internal:
+  kafka-ui:
     image: provectuslabs/kafka-ui:latest
     ports:
-      - "8081:8080"
+      - "8080:8080"
     depends_on:
+      - kafka
       - kafka-internal
     environment:
-      - KAFKA_CLUSTERS_0_NAME=internal
-      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka-internal:9092
+      - KAFKA_CLUSTERS_0_NAME=gateway
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+
+      - KAFKA_CLUSTERS_1_NAME=internal
+      - KAFKA_CLUSTERS_1_BOOTSTRAPSERVERS=kafka-internal:9092
 
 volumes:
   kafka_data:

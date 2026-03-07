@@ -328,6 +328,7 @@ def _build_response(response: dict[str, Any]) -> Response:
     status_code: int = response.get("status_code", 200)
     body: Any        = response.get("body", "")
     headers: dict    = response.get("headers") or {}
+    print(f"Building response: status_code: {status_code}, body: {body}, headers: {headers}")
 
     if isinstance(body, (dict, list)):
         return jsonify(body), status_code, headers

@@ -444,14 +444,14 @@ def route(payload: dict[str, Any], conn) -> tuple[int, Any]:
     clean_path            = "/" + "/".join(segments) if segments else "/"
     clean_path_with_slash = clean_path if clean_path.endswith("/") else clean_path + "/"
 
-    print(f"routing: method: {method}, clean_path: {clean_path_with_slash}, orignal path: {path}, headers: {headers}, segments: {segments}")
+    print(f"routing: method: {method}, clean_path: {clean_path_with_slash}, orignal path: {path}, headers: {headers}, segments: {segments}, path_params: {segments[1:]}")
 
     for route_method, prefix, handler in ROUTES:
         if method == route_method and clean_path_with_slash.startswith(prefix):
             # /item/create/<price> has an extra path segment before the param
             if prefix.startswith("/item/"):
-                return handler(conn, segments[1:], body, headers)
-            return handler(conn, segments, body, headers)
+                return handler(conn, segments[2:], body, headers)
+            return handler(conn, segments[1:], body, headers)
 
     return 404, {"error": f"No handler for {method} {path}"}
 

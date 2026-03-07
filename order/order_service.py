@@ -365,7 +365,7 @@ def _fetch_item_price(item_id: str) -> dict | None:
         topic=INTERNAL_STOCK_TOPIC,
         correlation_id=corr_id,
         method="GET",
-        path=f"/stock/find/{item_id}",
+        path=f"/find/{item_id}",
     )
 
     if not event.wait(timeout=10):
@@ -426,12 +426,14 @@ def handle_add_item(conn, path_params, _body, _headers) -> tuple[int, Any]:
         order_id = path_params[0]
         item_id  = path_params[1]
         quantity = int(path_params[2])
+        print(f"Handeling add item, with: order_id: {order_id}, item_id: {item_id}, quantity: {quantity}")
     except (IndexError, ValueError):
         return 400, {"error": "Expected /addItem/<order_id>/<item_id>/<quantity>"}
 
     # add_item requires item price — one synchronous internal call is acceptable
     # here since this is not on the checkout hot path and involves no saga state.
     stock_response = _fetch_item_price(item_id)
+    print(f"got stock respone: {stock_response}")
     if stock_response is None:
         return 503, {"error": "Stock service timeout fetching item price"}
     if stock_response.get("status_code") != 200:
@@ -516,7 +518,7 @@ def handle_checkout(conn, path_params, _body, headers) -> tuple[int, Any] | None
         topic=INTERNAL_STOCK_TOPIC,
         correlation_id=stock_corr_id,
         method="POST",
-        path="/stock/subtract_batch",
+        path="/subtract_batch",
         body={"items": batch_items},
         headers={"Idempotency-Key": stock_corr_id},
     )
@@ -549,9 +551,11 @@ def route_gateway_message(payload: dict[str, Any], conn) -> tuple[int, Any] | No
     clean_path            = "/" + "/".join(segments) if segments else "/"
     clean_path_with_slash = clean_path if clean_path.endswith("/") else clean_path + "/"
 
+    print(f"routing: method: {method}, clean_path: {clean_path_with_slash}, orignal path: {path}, headers: {headers}, segments: {segments}, path_params: {segments[1:]}")
+
     for route_method, prefix, handler in ROUTES:
         if method == route_method and clean_path_with_slash.startswith(prefix):
-            return handler(conn, segments, body, headers)
+            return handler(conn, segments[1:], body, headers)
 
     return 404, {"error": f"No handler for {method} {path}"}
 
@@ -581,7 +585,7 @@ def _on_stock_response(conn, saga: dict, response: dict) -> None:
             topic=INTERNAL_PAYMENT_TOPIC,
             correlation_id=payment_corr_id,
             method="POST",
-            path=f"/payment/pay/{order['user_id']}/{order['total_cost']}",
+            path=f"/pay/{order['user_id']}/{order['total_cost']}",
             headers={"Idempotency-Key": payment_corr_id},
         )
     else:
@@ -624,7 +628,7 @@ def _fire_rollback(conn, saga: dict) -> None:
         topic=INTERNAL_STOCK_TOPIC,
         correlation_id=rollback_corr_id,
         method="POST",
-        path="/stock/add_batch",
+        path="/add_batch",
         body={"items": batch_items},
         headers={"Idempotency-Key": rollback_corr_id},
     )
