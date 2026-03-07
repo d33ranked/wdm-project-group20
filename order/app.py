@@ -142,27 +142,44 @@ def find_order(order_id: str):
     )
 
 
-def send_post_request(url: str, idempotency_key: str = None):
+def send_post_request(url: str, idempotency_key: str = None, max_retries: int = 3):
     headers = {}
 
     # set idempotency key in headers
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
-    try:
-        start_time = perf_counter()
-        response = requests.post(url, headers=headers)
-        duration = perf_counter() - start_time
-        print(f"ORDER: POST request took {duration:.7f} seconds")
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
-    else:
-        return response
+
+    # retry and backoff
+    start_time = perf_counter()
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(url, headers=headers, timeout=5)
+            # 2xx or 4xx is valid response, don't retry
+            if response.status_code < 500:
+                duration = perf_counter() - start_time
+                print(f"ORDER: POST request took {duration:.7f} seconds")
+                return response
+            # 5xx is retryable error, retry
+            app.logger.warning(
+                f"Retry {attempt + 1}/{max_retries} for {url} returned {response.status_code}"
+            )
+        except requests.exceptions.RequestException as e:
+            app.logger.warning(
+                f"Retry {attempt + 1}/{max_retries} for {url} failed: {e}"
+            )
+            if attempt == max_retries:
+                abort(503, REQ_ERROR_STR)
+        # exponential backoff
+        if attempt < max_retries:
+            wait = 0.1 * (2**attempt)
+            time.sleep(wait)
+    abort(503, REQ_ERROR_STR)
 
 
 def send_get_request(url: str):
     try:
         start_time = perf_counter()
-        response = requests.get(url)
+        response = requests.get(url, timeout=5)
         duration = perf_counter() - start_time
         print(f"ORDER: GET request took {duration:.7f} seconds")
     except requests.exceptions.RequestException:
