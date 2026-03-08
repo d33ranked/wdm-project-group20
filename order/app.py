@@ -169,12 +169,12 @@ def send_post_request(url: str, idempotency_key: str = None, max_retries: int = 
                 f"Retry {attempt + 1}/{max_retries} for {url} failed: {e}"
             )
             if attempt == max_retries:
-                abort(503, REQ_ERROR_STR)
+                abort(400, REQ_ERROR_STR)
         # exponential backoff
         if attempt < max_retries:
             wait = 0.1 * (2**attempt)
             time.sleep(wait)
-    abort(503, REQ_ERROR_STR)
+    abort(400, REQ_ERROR_STR)
 
 
 def send_get_request(url: str):
