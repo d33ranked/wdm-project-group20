@@ -488,6 +488,15 @@ def recovery_tpc():
             user_id,
             total_cost,
         ) in rows:
+            # ensure prepared_stock is a list (JSONB may come as list or str)
+            if prepared_stock is None:
+                prepared_stock = []
+            elif isinstance(prepared_stock, str):
+                try:
+                    prepared_stock = json.loads(prepared_stock) if prepared_stock else []
+                except (TypeError, ValueError):
+                    prepared_stock = []
+
             app.logger.warning(
                 f"RECOVERY: Found incomplete transaction txn={txn_id}, status={status}"
             )

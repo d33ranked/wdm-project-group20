@@ -284,6 +284,51 @@ def save_idempotency(status_code, body):
     cur.close()
 
 
+def recovery_tpc():
+    conn = conn_pool.getconn()
+
+    # on startup, check for stale prepared transactions
+    try:
+        cur = conn.cursor()
+
+        # get all stale prepared transactions (older than 5 minutes)
+        cur.execute(
+            "SELECT txn_id, user_id, amount FROM prepared_transactions WHERE created_at < NOW() - INTERVAL '5 minutes'"
+        )
+        rows = cur.fetchall()
+
+        # return if none found
+        if not rows:
+            cur.close()
+            app.logger.info("RECOVERY: No stale prepared transactions found")
+            return
+
+        # process each - restore credit and remove the rollback record
+        for txn_id, user_id, amount in rows:
+            app.logger.warning(
+                f"RECOVERY: Aborting stale prepared transaction txn={txn_id}, user={user_id}, amount={amount}"
+            )
+            cur.execute("SELECT credit FROM users WHERE id = %s FOR UPDATE", (user_id,))
+            if cur.fetchone() is not None:
+                cur.execute(
+                    "UPDATE users SET credit = credit + %s WHERE id = %s",
+                    (amount, user_id),
+                )
+            cur.execute("DELETE FROM prepared_transactions WHERE txn_id = %s", (txn_id,))
+            conn.commit()
+
+        cur.close()
+    finally:
+        conn_pool.putconn(conn)
+
+
+with app.app_context():
+    try:
+        recovery_tpc()
+    except Exception as e:
+        app.logger.warning(f"RECOVERY PAYMENT: Error during recovery: {e}")
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
