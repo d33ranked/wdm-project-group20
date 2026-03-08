@@ -177,6 +177,80 @@ def remove_stock(item_id: str, amount: int):
     return Response(body, status=200)
 
 
+@app.post("/prepare/<txn_id>/<item_id>/<quantity>")
+def prepare_transaction(txn_id: str, item_id: str, quantity: int):
+    quantity = int(quantity)
+    cur = g.conn.cursor()
+
+    # check if the transaction is already prepared
+    cur.execute(
+        "SELECT 1 FROM prepared_transactions WHERE txn_id = %s AND item_id = %s",
+        (txn_id, item_id),
+    )
+    if cur.fetchone() is not None:
+        cur.close()
+        return Response("Transaction already prepared", status=200)
+
+    # lock item row for update
+    cur.execute("SELECT stock FROM items WHERE id = %s FOR UPDATE", (item_id,))
+    row = cur.fetchone()
+
+    # check if the item has enough stock
+    if row is None:
+        cur.close()
+        abort(400, f"Item: {item_id} not found!")
+    current_stock = row[0]
+    if current_stock < quantity:
+        cur.close()
+        abort(400, f"Item: {item_id} has insufficient stock!")
+
+    # deduct and record for possible rollback
+    cur.execute(
+        "UPDATE items SET stock = stock - %s WHERE id = %s", (quantity, item_id)
+    )
+    cur.execute(
+        "INSERT INTO prepared_transactions (txn_id, item_id, quantity) VALUES (%s, %s, %s)",
+        (txn_id, item_id, quantity),
+    )
+    cur.close()
+    return Response("Transaction prepared", status=200)
+
+
+@app.post("/commit/<txn_id>")
+def commit_transaction(txn_id: str):
+    cur = g.conn.cursor()
+
+    # remove the rollback records
+    cur.execute("DELETE FROM prepared_transactions WHERE txn_id = %s", (txn_id,))
+    cur.close()
+    return Response("Transaction committed", status=200)
+
+
+@app.post("/abort/<txn_id>")
+def abort_transaction(txn_id: str):
+    cur = g.conn.cursor()
+
+    # fetch (all) rollback records for this transaction
+    cur.execute(
+        "SELECT item_id, quantity FROM prepared_transactions WHERE txn_id = %s",
+        (txn_id,),
+    )
+    rows = cur.fetchall()
+
+    # add back the stock for each item
+    for item_id, quantity in rows:
+        cur.execute(
+            "UPDATE items SET stock = stock + %s WHERE id = %s", (quantity, item_id)
+        )
+
+    # remove the rollback records
+    cur.execute("DELETE FROM prepared_transactions WHERE txn_id = %s", (txn_id,))
+    cur.close()
+
+    # return success - even if no rows were found (duplicate abort or already committed) so is idempotent
+    return Response("Transaction aborted", status=200)
+
+
 # generate advisory lock id from idempotency key
 def idempotency_token(key: str) -> int:
     return int(hashlib.md5(key.encode()).hexdigest(), 16) % (2**31)
