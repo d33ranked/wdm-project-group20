@@ -22,6 +22,7 @@ DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ["GATEWAY_URL"]
+TRANSACTION_MODE = os.environ.get("TRANSACTION_MODE", "TPC")
 
 app = Flask("order-service")
 
@@ -258,6 +259,13 @@ def abort_tpc(txn_id: str, prepared_stock: list, prepared_payment: bool):
 
 @app.post("/checkout/<order_id>")
 def checkout(order_id: str):
+    if TRANSACTION_MODE == "TPC":
+        return checkout_tpc(order_id)
+    else:
+        return checkout_saga(order_id)
+
+
+def checkout_saga(order_id: str):
     app.logger.debug(f"Checking out {order_id}")
 
     # generate idempotency key (transaction id)

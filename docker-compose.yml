@@ -14,6 +14,7 @@ services:
     build: ./order
     image: order:latest
     environment:
+      - TRANSACTION_MODE=TPC
       - GATEWAY_URL=http://gateway:80
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     command: gunicorn -k gevent -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
