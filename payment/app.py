@@ -23,8 +23,8 @@ def create_conn_pool(retries=10, delay=2):
     for attempt in range(retries):
         try:
             return psycopg2.pool.ThreadedConnectionPool(
-                minconn=3,
-                maxconn=30,
+                minconn=10,
+                maxconn=100,
                 host=os.environ["POSTGRES_HOST"],
                 port=int(os.environ["POSTGRES_PORT"]),
                 dbname=os.environ["POSTGRES_DB"],
