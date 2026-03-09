@@ -70,7 +70,7 @@ from kafka.errors import KafkaError
 # Configuration
 # ---------------------------------------------------------------------------
 
-KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka-external:9092")
 
 # How long the gateway waits for a service response before returning 504.
 # Checkout sagas can take longer than simple CRUD operations since they
@@ -231,22 +231,22 @@ class KafkaClient:
         the gateway pod in this case.
         """
         def consume() -> None:
-            consumer = kafka.KafkaConsumer(
-                RESPONSE_TOPIC,
-                bootstrap_servers=self.bootstrap_servers,
-                group_id="gateway-response-listener",
-                auto_offset_reset="latest",
-                enable_auto_commit=True,
-                value_deserializer=lambda m: json.loads(m.decode("utf-8")),
-            )
-            logger.info("Response consumer started on '%s'", RESPONSE_TOPIC)
-            try:
-                for message in consumer:
-                    self._handle_response(message.value)
-            except Exception as exc:
-                logger.error("Response consumer crashed: %s", exc, exc_info=True)
-            finally:
-                consumer.close()
+            while True:
+                try:
+                    consumer = kafka.KafkaConsumer(
+                        RESPONSE_TOPIC,
+                        bootstrap_servers=self.bootstrap_servers,
+                        group_id="gateway-response-listener",
+                        auto_offset_reset="latest",
+                        enable_auto_commit=True,
+                        value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+                    )
+                    logger.info("Response consumer started on '%s'", RESPONSE_TOPIC)
+                    for message in consumer:
+                        self._handle_response(message.value)
+                except Exception as exc:
+                    logger.error("Response consumer crashed, reconnecting in 3s: %s", exc)
+                    time.sleep(3)
 
         threading.Thread(target=consume, daemon=True, name="kafka-response-consumer").start()
 
