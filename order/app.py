@@ -139,10 +139,15 @@ def find_order(order_id: str):
     )
 
 
-def send_post_request(url: str):
+def send_post_request(url: str, idempotency_key: str = None):
+    headers = {}
+
+    # set idempotency key in headers
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
     try:
         start_time = perf_counter()
-        response = requests.post(url)
+        response = requests.post(url, headers=headers)
         duration = perf_counter() - start_time
         print(f"ORDER: POST request took {duration:.7f} seconds")
     except requests.exceptions.RequestException:
@@ -195,14 +200,22 @@ def add_item(order_id: str, item_id: str, quantity: int):
     )
 
 
-def rollback_stock(removed_items: list[tuple[str, int]]):
+def rollback_stock(removed_items: list[tuple[str, int]], transaction_id: str):
     for item_id, quantity in removed_items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
+        send_post_request(
+            f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}",
+            idempotency_key=f"{transaction_id}:stock:rollback:{item_id}",
+        )
 
 
 @app.post("/checkout/<order_id>")
 def checkout(order_id: str):
     app.logger.debug(f"Checking out {order_id}")
+
+    # generate idempotency key (transaction id)
+    transaction_id = str(uuid.uuid4())
+
+    # select and lock order
     cur = g.conn.cursor()
     cur.execute(
         "SELECT paid, items, user_id, total_cost FROM orders WHERE id = %s FOR UPDATE",
@@ -214,27 +227,35 @@ def checkout(order_id: str):
         abort(400, f"Order: {order_id} not found!")
     paid, items, user_id, total_cost = row
 
+    # aggregate item quantities
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in items:
         items_quantities[item_id] += quantity
 
+    # track successfully subtracted items
     removed_items: list[tuple[str, int]] = []
     for item_id, quantity in items_quantities.items():
         stock_reply = send_post_request(
-            f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}"
+            f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}",
+            idempotency_key=f"{transaction_id}:stock:subtract:{item_id}",
         )
         if stock_reply.status_code != 200:
-            rollback_stock(removed_items)
+            rollback_stock(removed_items, transaction_id)
             cur.close()
             abort(400, f"Out of stock on item_id: {item_id}")
         removed_items.append((item_id, quantity))
 
-    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{user_id}/{total_cost}")
+    # pay for the order
+    user_reply = send_post_request(
+        f"{GATEWAY_URL}/payment/pay/{user_id}/{total_cost}",
+        idempotency_key=f"{transaction_id}:payment:pay",
+    )
     if user_reply.status_code != 200:
-        rollback_stock(removed_items)
+        rollback_stock(removed_items, transaction_id)
         cur.close()
         abort(400, "User out of credit")
 
+    # update order status
     cur.execute("UPDATE orders SET paid = TRUE WHERE id = %s", (order_id,))
     cur.close()
     app.logger.debug("Checkout successful")

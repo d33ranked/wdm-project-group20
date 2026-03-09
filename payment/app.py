@@ -2,13 +2,14 @@ import os
 import uuid
 import time
 import atexit
+import hashlib
 import logging
 
 import psycopg2
 import psycopg2.pool
 
 from time import perf_counter
-from flask import Flask, jsonify, abort, Response, g
+from flask import Flask, jsonify, abort, request, Response, g
 
 
 DB_ERROR_STR = "DB error"
@@ -114,6 +115,12 @@ def find_user(user_id: str):
 
 @app.post("/add_funds/<user_id>/<amount>")
 def add_credit(user_id: str, amount: int):
+    # check idempotency key
+    cached = check_idempotency()
+    if cached is not None:
+        return cached
+
+    # add credit
     cur = g.conn.cursor()
     cur.execute("SELECT credit FROM users WHERE id = %s FOR UPDATE", (user_id,))
     row = cur.fetchone()
@@ -126,11 +133,21 @@ def add_credit(user_id: str, amount: int):
     )
     new_credit = cur.fetchone()[0]
     cur.close()
-    return Response(f"User: {user_id} credit updated to: {new_credit}", status=200)
+
+    # save idempotency key
+    body = f"User: {user_id} credit updated to: {new_credit}"
+    save_idempotency(200, body)
+    return Response(body, status=200)
 
 
 @app.post("/pay/<user_id>/<amount>")
 def remove_credit(user_id: str, amount: int):
+    # check idempotency key
+    cached = check_idempotency()
+    if cached is not None:
+        return cached
+
+    # remove credit
     cur = g.conn.cursor()
     cur.execute("SELECT credit FROM users WHERE id = %s FOR UPDATE", (user_id,))
     row = cur.fetchone()
@@ -147,7 +164,46 @@ def remove_credit(user_id: str, amount: int):
     )
     new_credit = cur.fetchone()[0]
     cur.close()
-    return Response(f"User: {user_id} credit updated to: {new_credit}", status=200)
+
+    # save idempotency key
+    body = f"User: {user_id} credit updated to: {new_credit}"
+    save_idempotency(200, body)
+    return Response(body, status=200)
+
+
+# generate advisory lock id from idempotency key
+def idempotency_token(key: str) -> int:
+    return int(hashlib.md5(key.encode()).hexdigest(), 16) % (2**31)
+
+
+def check_idempotency():
+    # check if this request was already processed. returns the cached response or None.
+    idem_key = request.headers.get("Idempotency-Key")
+    if not idem_key:
+        return None
+    cur = g.conn.cursor()
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (idempotency_token(idem_key),))
+    cur.execute(
+        "SELECT status_code, body FROM idempotency_keys WHERE key = %s", (idem_key,)
+    )
+    row = cur.fetchone()
+    cur.close()
+    if row is not None:
+        return Response(row[1], status=row[0])
+    return None
+
+
+def save_idempotency(status_code, body):
+    # save the result so future calls with the same key return this result.
+    idem_key = request.headers.get("Idempotency-Key")
+    if not idem_key:
+        return
+    cur = g.conn.cursor()
+    cur.execute(
+        "INSERT INTO idempotency_keys (key, status_code, body) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+        (idem_key, status_code, body),
+    )
+    cur.close()
 
 
 if __name__ == "__main__":
