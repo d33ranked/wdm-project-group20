@@ -339,7 +339,7 @@ def checkout_tpc(order_id: str):
     # return if order is already paid
     if paid:
         cur.close()
-        abort(400, "Order is already paid for!")
+        return Response("Order is already paid for!", status=200)
 
     # aggregate each item quantity
     items_quantities = defaultdict(int)
