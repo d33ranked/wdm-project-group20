@@ -217,7 +217,7 @@ def main():
     sep = "=" * LINE_WIDTH
     print()
     print(sep)
-    print("  Group 35 Test Suite")
+    print("  Group 20 Test Suite")
     print(sep)
 
     # --- Ask for mode ---
