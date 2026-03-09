@@ -428,7 +428,7 @@ def checkout_tpc(order_id: str):
 
     if paid:
         cur.close()
-        abort(400, "Order is already paid for!")
+        return Response("Order is already paid for!", status=200)
 
     items_quantities = defaultdict(int)
     for item_id, qty in items:
@@ -602,7 +602,7 @@ def checkout_saga_http(order_id: str):
 
     if paid:
         cur.close()
-        abort(400, "Order is already paid for!")
+        return Response("Order is already paid for!", status=200)
 
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in items:
