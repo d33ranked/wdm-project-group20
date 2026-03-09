@@ -16,7 +16,7 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:80
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -k gevent -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_db.env
     depends_on:
@@ -37,7 +37,7 @@ services:
     image: stock:latest
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -k gevent -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_db.env
     depends_on:
@@ -58,7 +58,7 @@ services:
     image: payment:latest
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -k gevent -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_db.env
     depends_on:
