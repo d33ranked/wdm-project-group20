@@ -1,34 +1,58 @@
-import logging
 import os
+import json
+import uuid
+import time
 import atexit
 import random
-import uuid
+import logging
 from collections import defaultdict
 
-import redis
+import psycopg2
 import requests
-
-from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response, g
+import psycopg2.pool
 
 from time import perf_counter
+from flask import Flask, jsonify, abort, Response, g
 
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
-GATEWAY_URL = os.environ['GATEWAY_URL']
+GATEWAY_URL = os.environ["GATEWAY_URL"]
 
 app = Flask("order-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+
+def create_conn_pool(retries=10, delay=2):
+    for attempt in range(retries):
+        try:
+            return psycopg2.pool.ThreadedConnectionPool(
+                minconn=2,
+                maxconn=10,
+                host=os.environ["POSTGRES_HOST"],
+                port=int(os.environ["POSTGRES_PORT"]),
+                dbname=os.environ["POSTGRES_DB"],
+                user=os.environ["POSTGRES_USER"],
+                password=os.environ["POSTGRES_PASSWORD"],
+            )
+        except psycopg2.OperationalError:
+            if attempt < retries - 1:
+                print(
+                    f"ORDER: PostgreSQL not ready, retrying in {delay}s... (attempt {attempt+1}/{retries})"
+                )
+                time.sleep(delay)
+            else:
+                raise
+
+
+conn_pool = create_conn_pool()
+
 
 @app.before_request
-def start_timer():
+def before_req():
     g.start_time = perf_counter()
+    g.conn = conn_pool.getconn()
+
 
 @app.after_request
 def log_response(response):
@@ -37,82 +61,80 @@ def log_response(response):
     return response
 
 
+@app.teardown_request
+def teardown_req(exception):
+    conn = g.pop("conn", None)
+    if conn is not None:
+        if exception:
+            conn.rollback()
+        else:
+            conn.commit()
+        conn_pool.putconn(conn)
+
+
 def close_db_connection():
-    db.close()
+    conn_pool.closeall()
 
 
 atexit.register(close_db_connection)
 
 
-class OrderValue(Struct):
-    paid: bool
-    items: list[tuple[str, int]]
-    user_id: str
-    total_cost: int
-
-
-def get_order_from_db(order_id: str) -> OrderValue | None:
-    try:
-        # get serialized data
-        entry: bytes = db.get(order_id)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
-    if entry is None:
-        # if order does not exist in the database; abort
+def get_order_from_db(order_id: str):
+    cur = g.conn.cursor()
+    cur.execute(
+        "SELECT paid, items, user_id, total_cost FROM orders WHERE id = %s", (order_id,)
+    )
+    row = cur.fetchone()
+    cur.close()
+    if row is None:
         abort(400, f"Order: {order_id} not found!")
-    return entry
+    return {"paid": row[0], "items": row[1], "user_id": row[2], "total_cost": row[3]}
 
 
-@app.post('/create/<user_id>')
+@app.post("/create/<user_id>")
 def create_order(user_id: str):
     key = str(uuid.uuid4())
-    value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
-    try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({'order_id': key})
+    cur = g.conn.cursor()
+    cur.execute(
+        "INSERT INTO orders (id, paid, items, user_id, total_cost) VALUES (%s, %s, %s, %s, %s)",
+        (key, False, json.dumps([]), user_id, 0),
+    )
+    cur.close()
+    return jsonify({"order_id": key})
 
 
-@app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
+@app.post("/batch_init/<n>/<n_items>/<n_users>/<item_price>")
 def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
-
     n = int(n)
     n_items = int(n_items)
     n_users = int(n_users)
     item_price = int(item_price)
-
-    def generate_entry() -> OrderValue:
-        user_id = random.randint(0, n_users - 1)
-        item1_id = random.randint(0, n_items - 1)
-        item2_id = random.randint(0, n_items - 1)
-        value = OrderValue(paid=False,
-                           items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
-                           user_id=f"{user_id}",
-                           total_cost=2*item_price)
-        return value
-
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
-                                  for i in range(n)}
-    try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    cur = g.conn.cursor()
+    for i in range(n):
+        user_id = str(random.randint(0, n_users - 1))
+        item1_id = str(random.randint(0, n_items - 1))
+        item2_id = str(random.randint(0, n_items - 1))
+        items = [[item1_id, 1], [item2_id, 1]]
+        cur.execute(
+            "INSERT INTO orders (id, paid, items, user_id, total_cost) VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (id) DO UPDATE SET paid = EXCLUDED.paid, items = EXCLUDED.items, "
+            "user_id = EXCLUDED.user_id, total_cost = EXCLUDED.total_cost",
+            (str(i), False, json.dumps(items), user_id, 2 * item_price),
+        )
+    cur.close()
     return jsonify({"msg": "Batch init for orders successful"})
 
 
-@app.get('/find/<order_id>')
+@app.get("/find/<order_id>")
 def find_order(order_id: str):
-    order_entry: OrderValue = get_order_from_db(order_id)
+    order = get_order_from_db(order_id)
     return jsonify(
         {
             "order_id": order_id,
-            "paid": order_entry.paid,
-            "items": order_entry.items,
-            "user_id": order_entry.user_id,
-            "total_cost": order_entry.total_cost
+            "paid": order["paid"],
+            "items": order["items"],
+            "user_id": order["user_id"],
+            "total_cost": order["total_cost"],
         }
     )
 
@@ -141,22 +163,36 @@ def send_get_request(url: str):
         return response
 
 
-@app.post('/addItem/<order_id>/<item_id>/<quantity>')
+@app.post("/addItem/<order_id>/<item_id>/<quantity>")
 def add_item(order_id: str, item_id: str, quantity: int):
-    order_entry: OrderValue = get_order_from_db(order_id)
+    cur = g.conn.cursor()
+    cur.execute(
+        "SELECT items, total_cost FROM orders WHERE id = %s FOR UPDATE", (order_id,)
+    )
+    row = cur.fetchone()
+    if row is None:
+        cur.close()
+        abort(400, f"Order: {order_id} not found!")
+    items, total_cost = row
+
     item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
     if item_reply.status_code != 200:
-        # Request failed because item does not exist
+        cur.close()
         abort(400, f"Item: {item_id} does not exist!")
-    item_json: dict = item_reply.json()
-    order_entry.items.append((item_id, int(quantity)))
-    order_entry.total_cost += int(quantity) * item_json["price"]
-    try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
-                    status=200)
+
+    item_json = item_reply.json()
+    items.append([item_id, int(quantity)])
+    total_cost += int(quantity) * item_json["price"]
+
+    cur.execute(
+        "UPDATE orders SET items = %s, total_cost = %s WHERE id = %s",
+        (json.dumps(items), total_cost, order_id),
+    )
+    cur.close()
+    return Response(
+        f"Item: {item_id} added to: {order_id} price updated to: {total_cost}",
+        status=200,
+    )
 
 
 def rollback_stock(removed_items: list[tuple[str, int]]):
@@ -164,41 +200,50 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
         send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
 
 
-@app.post('/checkout/<order_id>')
+@app.post("/checkout/<order_id>")
 def checkout(order_id: str):
     app.logger.debug(f"Checking out {order_id}")
-    order_entry: OrderValue = get_order_from_db(order_id)
-    # get the quantity per item
+    cur = g.conn.cursor()
+    cur.execute(
+        "SELECT paid, items, user_id, total_cost FROM orders WHERE id = %s FOR UPDATE",
+        (order_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        cur.close()
+        abort(400, f"Order: {order_id} not found!")
+    paid, items, user_id, total_cost = row
+
     items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in order_entry.items:
+    for item_id, quantity in items:
         items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
+
     removed_items: list[tuple[str, int]] = []
     for item_id, quantity in items_quantities.items():
-        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
+        stock_reply = send_post_request(
+            f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}"
+        )
         if stock_reply.status_code != 200:
-            # If one item does not have enough stock we need to rollback
             rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
+            cur.close()
+            abort(400, f"Out of stock on item_id: {item_id}")
         removed_items.append((item_id, quantity))
-    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
+
+    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{user_id}/{total_cost}")
     if user_reply.status_code != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
         rollback_stock(removed_items)
+        cur.close()
         abort(400, "User out of credit")
-    order_entry.paid = True
-    try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+
+    cur.execute("UPDATE orders SET paid = TRUE WHERE id = %s", (order_id,))
+    cur.close()
     app.logger.debug("Checkout successful")
     return Response("Checkout successful", status=200)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
+    gunicorn_logger = logging.getLogger("gunicorn.error")
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)

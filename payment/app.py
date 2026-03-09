@@ -1,28 +1,50 @@
-import logging
 import os
-import atexit
 import uuid
+import time
+import atexit
+import logging
 
-import redis
-
-from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response, g
+import psycopg2
+import psycopg2.pool
 
 from time import perf_counter
+from flask import Flask, jsonify, abort, Response, g
+
 
 DB_ERROR_STR = "DB error"
-
-
 app = Flask("payment-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+
+def create_conn_pool(retries=10, delay=2):
+    for attempt in range(retries):
+        try:
+            return psycopg2.pool.ThreadedConnectionPool(
+                minconn=2,
+                maxconn=10,
+                host=os.environ["POSTGRES_HOST"],
+                port=int(os.environ["POSTGRES_PORT"]),
+                dbname=os.environ["POSTGRES_DB"],
+                user=os.environ["POSTGRES_USER"],
+                password=os.environ["POSTGRES_PASSWORD"],
+            )
+        except psycopg2.OperationalError:
+            if attempt < retries - 1:
+                print(
+                    f"PAYMENT: PostgreSQL not ready, retrying in {delay}s... (attempt {attempt+1}/{retries})"
+                )
+                time.sleep(delay)
+            else:
+                raise
+
+
+conn_pool = create_conn_pool()
+
 
 @app.before_request
 def start_timer():
     g.start_time = perf_counter()
+    g.conn = conn_pool.getconn()
+
 
 @app.after_request
 def log_response(response):
@@ -30,96 +52,107 @@ def log_response(response):
     print(f"PAYMENT: Request took {duration:.7f} seconds")
     return response
 
+
+# a cleanup function to return the connection to the pool
+@app.teardown_request
+def teardown_request(exception):
+    conn = g.pop("conn", None)
+    if conn is not None:
+        if exception:
+            conn.rollback()
+        else:
+            conn.commit()
+        conn_pool.putconn(conn)
+
+
 def close_db_connection():
-    db.close()
+    conn_pool.closeall()
 
 
 atexit.register(close_db_connection)
 
 
-class UserValue(Struct):
-    credit: int
-
-
-def get_user_from_db(user_id: str) -> UserValue | None:
-    try:
-        # get serialized data
-        entry: bytes = db.get(user_id)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
-    if entry is None:
-        # if user does not exist in the database; abort
+def get_user_from_db(user_id: str):
+    cur = g.conn.cursor()
+    cur.execute("SELECT credit FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    cur.close()
+    if row is None:
         abort(400, f"User: {user_id} not found!")
-    return entry
+    return {"credit": row[0]}
 
 
-@app.post('/create_user')
+@app.post("/create_user")
 def create_user():
     key = str(uuid.uuid4())
-    value = msgpack.encode(UserValue(credit=0))
-    try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({'user_id': key})
+    cur = g.conn.cursor()
+    cur.execute("INSERT INTO users (id, credit) VALUES (%s, %s)", (key, 0))
+    cur.close()
+    return jsonify({"user_id": key})
 
 
-@app.post('/batch_init/<n>/<starting_money>')
+@app.post("/batch_init/<n>/<starting_money>")
 def batch_init_users(n: int, starting_money: int):
     n = int(n)
     starting_money = int(starting_money)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
-                                  for i in range(n)}
-    try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    cur = g.conn.cursor()
+    for i in range(n):
+        cur.execute(
+            "INSERT INTO users (id, credit) VALUES (%s, %s) "
+            "ON CONFLICT (id) DO UPDATE SET credit = EXCLUDED.credit",
+            (str(i), starting_money),
+        )
+    cur.close()
     return jsonify({"msg": "Batch init for users successful"})
 
 
-@app.get('/find_user/<user_id>')
+@app.get("/find_user/<user_id>")
 def find_user(user_id: str):
-    user_entry: UserValue = get_user_from_db(user_id)
-    return jsonify(
-        {
-            "user_id": user_id,
-            "credit": user_entry.credit
-        }
-    )
+    user = get_user_from_db(user_id)
+    return jsonify({"user_id": user_id, "credit": user["credit"]})
 
 
-@app.post('/add_funds/<user_id>/<amount>')
+@app.post("/add_funds/<user_id>/<amount>")
 def add_credit(user_id: str, amount: int):
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
-    user_entry.credit += int(amount)
-    try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+    cur = g.conn.cursor()
+    cur.execute("SELECT credit FROM users WHERE id = %s FOR UPDATE", (user_id,))
+    row = cur.fetchone()
+    if row is None:
+        cur.close()
+        abort(400, f"User: {user_id} not found!")
+    cur.execute(
+        "UPDATE users SET credit = credit + %s WHERE id = %s RETURNING credit",
+        (int(amount), user_id),
+    )
+    new_credit = cur.fetchone()[0]
+    cur.close()
+    return Response(f"User: {user_id} credit updated to: {new_credit}", status=200)
 
 
-@app.post('/pay/<user_id>/<amount>')
+@app.post("/pay/<user_id>/<amount>")
 def remove_credit(user_id: str, amount: int):
-    app.logger.debug(f"Removing {amount} credit from user: {user_id}")
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
-    user_entry.credit -= int(amount)
-    if user_entry.credit < 0:
+    cur = g.conn.cursor()
+    cur.execute("SELECT credit FROM users WHERE id = %s FOR UPDATE", (user_id,))
+    row = cur.fetchone()
+    if row is None:
+        cur.close()
+        abort(400, f"User: {user_id} not found!")
+    current_credit = row[0]
+    if current_credit - int(amount) < 0:
+        cur.close()
         abort(400, f"User: {user_id} credit cannot get reduced below zero!")
-    try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+    cur.execute(
+        "UPDATE users SET credit = credit - %s WHERE id = %s RETURNING credit",
+        (int(amount), user_id),
+    )
+    new_credit = cur.fetchone()[0]
+    cur.close()
+    return Response(f"User: {user_id} credit updated to: {new_credit}", status=200)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
+    gunicorn_logger = logging.getLogger("gunicorn.error")
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)

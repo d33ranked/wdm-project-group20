@@ -18,14 +18,19 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
-      - env/order_redis.env
+      - env/order_db.env
     depends_on:
       - order-db
       - kafka
 
   order-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    image: postgres
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=orders
+    volumes:
+      - ./order/init.sql:/docker-entrypoint-initdb.d/init.sql
 
   stock-service:
     build: ./stock
@@ -34,14 +39,19 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
-      - env/stock_redis.env
+      - env/stock_db.env
     depends_on:
       - stock-db
       - kafka
 
   stock-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    image: postgres
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=stock
+    volumes:
+      - ./stock/init.sql:/docker-entrypoint-initdb.d/init.sql
 
   payment-service:
     build: ./payment
@@ -50,14 +60,19 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
-      - env/payment_redis.env
+      - env/payment_db.env
     depends_on:
       - payment-db
       - kafka
 
   payment-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    image: postgres
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=payments
+    volumes:
+      - ./payment/init.sql:/docker-entrypoint-initdb.d/init.sql
 
   kafka:
     image: apache/kafka:latest
