@@ -140,6 +140,8 @@ Compensating transaction: payment fails (insufficient credit) → saga fires `ad
 
 ### Benchmarking
 
+- Strong Benchmarking Suite Cases
+
 - Parameter Tuning + Increasing RPS
 - Structured Locust scenarios (create → add items → checkout)
 - Latency (p50/p95/p99) and throughput (req/s) for TPC
