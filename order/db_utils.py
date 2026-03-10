@@ -2,6 +2,7 @@
 Database utilities for high-availability PostgreSQL with Patroni.
 Provides automatic primary discovery and connection pool failover.
 """
+# TODO: Remove code duplication
 
 import os
 import time

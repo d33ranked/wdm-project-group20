@@ -1,4 +1,5 @@
 #!/bin/bash
+# TODO: Remove code duplication
 
 echo "POST_BOOTSTRAP: Starting post-bootstrap script for orders database"
 
