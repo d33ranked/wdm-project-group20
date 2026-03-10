@@ -146,18 +146,19 @@ def wait_for_services(timeout: int = 90):
     endpoints = [
         "/stock/item/create/1",
         "/payment/create_user",
+        "/orders/create/healthcheck",
     ]
     start = time.time()
     while time.time() - start < timeout:
         try:
             ok = all(
-                requests.post(f"{BASE_URL}{ep}", timeout=5).status_code == 200
+                requests.post(f"{BASE_URL}{ep}", timeout=5).status_code < 300
                 for ep in endpoints
             )
             if ok:
                 print("  All Services Are Up.\n")
                 return
-        except requests.ConnectionError:
+        except requests.RequestException:
             pass
         time.sleep(3)
     print("  Timed Out Waiting for Services.")
@@ -229,7 +230,7 @@ def main():
     sep = "=" * LINE_WIDTH
     print()
     print(sep)
-    print("  Group 20 Test Suite")
+    print("  BENCHMARKING SUITE — GROUP 20")
     print(sep)
 
     # --- Ask for mode ---

@@ -581,6 +581,93 @@ def recovery_tpc():
     finally:
         conn_pool.putconn(conn)
 
+def recovery_saga():
+    """Recover incomplete sagas by re-publishing the pending Kafka message.
+
+    Safe because all downstream consumers are idempotent — re-publishing
+    a subtract_batch, pay, or add_batch with the same idempotency key
+    returns the cached result without double-processing.
+    """
+    terminal_states = (
+        SagaState.COMPLETED, SagaState.STOCK_FAILED,
+        SagaState.PAYMENT_FAILED, SagaState.ROLLED_BACK,
+        SagaState.ROLLBACK_FAILED,
+    )
+    conn = conn_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, order_id, state, items_quantities FROM sagas "
+                "WHERE state NOT IN %s",
+                (terminal_states,),
+            )
+            rows = cur.fetchall()
+
+        if not rows:
+            app.logger.info("SAGA RECOVERY: No incomplete sagas found")
+            return
+
+        for saga_id, order_id, state, items_quantities in rows:
+            app.logger.warning(
+                "SAGA RECOVERY: Found incomplete saga %s in state %s (order %s)",
+                saga_id, state, order_id,
+            )
+
+            if isinstance(items_quantities, str):
+                items_quantities = json.loads(items_quantities)
+
+            batch_items = [
+                {"item_id": iid, "amount": qty}
+                for iid, qty in items_quantities.items()
+            ]
+
+            if state == SagaState.STOCK_REQUESTED:
+                corr_id = f"{saga_id}:stock:subtract_batch"
+                publish_internal_request(
+                    topic=INTERNAL_STOCK_TOPIC,
+                    correlation_id=corr_id,
+                    method="POST",
+                    path="/subtract_batch",
+                    body={"items": batch_items},
+                    headers={"Idempotency-Key": corr_id},
+                )
+
+            elif state == SagaState.PAYMENT_REQUESTED:
+                try:
+                    order = db_get_order(conn, order_id)
+                except ValueError:
+                    app.logger.error(
+                        "SAGA RECOVERY: Order %s not found for saga %s, skipping",
+                        order_id, saga_id,
+                    )
+                    continue
+                corr_id = f"{saga_id}:payment:pay"
+                publish_internal_request(
+                    topic=INTERNAL_PAYMENT_TOPIC,
+                    correlation_id=corr_id,
+                    method="POST",
+                    path=f"/pay/{order['user_id']}/{order['total_cost']}",
+                    headers={"Idempotency-Key": corr_id},
+                )
+
+            elif state == SagaState.ROLLBACK_REQUESTED:
+                corr_id = f"{saga_id}:stock:rollback"
+                publish_internal_request(
+                    topic=INTERNAL_STOCK_TOPIC,
+                    correlation_id=corr_id,
+                    method="POST",
+                    path="/add_batch",
+                    body={"items": batch_items},
+                    headers={"Idempotency-Key": corr_id},
+                )
+
+            app.logger.info(
+                "SAGA RECOVERY: Re-published message for saga %s (state=%s)",
+                saga_id, state,
+            )
+    finally:
+        conn_pool.putconn(conn)
+
 # ============================================================================
 # SAGA — synchronous HTTP fallback (used when Kafka is unavailable)
 # ============================================================================
@@ -1090,6 +1177,10 @@ with app.app_context():
     elif TRANSACTION_MODE == "SAGA":
         gateway_producer = _build_kafka_producer(GATEWAY_KAFKA)
         internal_producer = _build_kafka_producer(INTERNAL_KAFKA)
+        try:
+            recovery_saga()
+        except Exception as e:
+            app.logger.warning(f"SAGA RECOVERY: Error during recovery: {e}")
         threading.Thread(target=start_gateway_consumer, daemon=True, name="gateway-consumer").start()
         threading.Thread(target=start_internal_consumer, daemon=True, name="internal-consumer").start()
         app.logger.info("SAGA mode: Kafka producers and consumers started")
