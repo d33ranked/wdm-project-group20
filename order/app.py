@@ -1,3 +1,29 @@
+"""
+Order Service
+=============
+Manages orders and acts as the transaction coordinator for checkout.
+
+Supports two transaction modes controlled by the TRANSACTION_MODE env var:
+
+  TPC  — Synchronous Two-Phase Commit over HTTP. The order service is the
+         coordinator: it PREPAREs stock and payment participants, then
+         COMMITs or ABORTs based on their votes. Every state transition
+         is persisted to the transaction_log table before the next external
+         call, providing a durable coordinator log for crash recovery.
+
+  SAGA — Asynchronous orchestration over Kafka. The order service publishes
+         saga commands to internal.stock and internal.payment, advances
+         state based on responses, and fires compensating transactions
+         (rollbacks) on failure. State is persisted to the sagas table.
+
+In both modes, the order service is the single source of truth for
+checkout atomicity. Stock and payment are passive participants that
+execute commands and report results.
+"""
+
+# gevent monkey-patching must happen before any other imports so that
+# stdlib blocking calls (socket, time.sleep, threading) are replaced
+# with cooperative greenlet-friendly versions.
 import gevent.monkey
 gevent.monkey.patch_all()
 
@@ -19,8 +45,9 @@ import psycopg2.pool
 from time import perf_counter
 from flask import Flask, jsonify, abort, Response, g
 
-DB_ERROR_STR = "DB error"
-REQ_ERROR_STR = "Requests error"
+from common.db import create_conn_pool, setup_flask_lifecycle, setup_gunicorn_logging
+from common.idempotency import check_idempotency_kafka, save_idempotency_kafka
+from common.kafka_helpers import build_producer
 
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://nginx:80")
 TRANSACTION_MODE = os.environ.get("TRANSACTION_MODE", "TPC")
@@ -29,7 +56,6 @@ GATEWAY_KAFKA = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka-external:9092")
 INTERNAL_KAFKA = os.environ.get("INTERNAL_KAFKA_BOOTSTRAP_SERVERS", "kafka-internal:9092")
 
 app = Flask("order-service")
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -58,82 +84,19 @@ class SagaState:
     ROLLBACK_FAILED = "ROLLBACK_FAILED"
 
 # ---------------------------------------------------------------------------
-# DB pool
+# DB pool and Flask lifecycle
 # ---------------------------------------------------------------------------
 
-def create_conn_pool(retries=10, delay=2):
-    for attempt in range(retries):
-        try:
-            return psycopg2.pool.ThreadedConnectionPool(
-                minconn=10,
-                maxconn=100,
-                host=os.environ["POSTGRES_HOST"],
-                port=int(os.environ["POSTGRES_PORT"]),
-                dbname=os.environ["POSTGRES_DB"],
-                user=os.environ["POSTGRES_USER"],
-                password=os.environ["POSTGRES_PASSWORD"],
-            )
-        except psycopg2.OperationalError:
-            if attempt < retries - 1:
-                print(
-                    f"ORDER: PostgreSQL not ready, retrying in {delay}s... (attempt {attempt+1}/{retries})"
-                )
-                time.sleep(delay)
-            else:
-                raise
-
-
-conn_pool = create_conn_pool()
-
-
-def close_db_connection():
-    conn_pool.closeall()
-
-
-atexit.register(close_db_connection)
-
-# ---------------------------------------------------------------------------
-# Flask request lifecycle (used in TPC mode for HTTP endpoints)
-# ---------------------------------------------------------------------------
-
-@app.before_request
-def before_req():
-    g.start_time = perf_counter()
-    g.conn = conn_pool.getconn()
-
-
-@app.after_request
-def log_response(response):
-    duration = perf_counter() - g.start_time
-    print(f"ORDER: Request took {duration:.7f} seconds")
-    return response
-
-
-@app.teardown_request
-def teardown_req(exception):
-    conn = g.pop("conn", None)
-    if conn is not None:
-        if exception:
-            conn.rollback()
-        else:
-            conn.commit()
-        conn_pool.putconn(conn)
+conn_pool = create_conn_pool("ORDER")
+setup_flask_lifecycle(app, conn_pool, "ORDER")
 
 # ---------------------------------------------------------------------------
 # DB helpers — orders
+#
+# A single db_get_order() that takes a connection parameter is used by both
+# Flask routes and Kafka handlers. Flask routes catch ValueError and convert
+# it to abort(400).
 # ---------------------------------------------------------------------------
-
-def get_order_from_db(order_id: str):
-    cur = g.conn.cursor()
-    cur.execute(
-        "SELECT paid, items, user_id, total_cost FROM orders WHERE id = %s", (order_id,)
-    )
-    row = cur.fetchone()
-    cur.close()
-    if row is None:
-        abort(400, f"Order: {order_id} not found!")
-    return {"paid": row[0], "items": row[1], "user_id": row[2], "total_cost": row[3]}
-
 
 def db_get_order(conn, order_id: str) -> dict:
     with conn.cursor() as cur:
@@ -148,6 +111,11 @@ def db_get_order(conn, order_id: str) -> dict:
 
 
 def db_get_order_for_update(conn, order_id: str) -> dict:
+    """Same as db_get_order but acquires a row-level lock (FOR UPDATE).
+
+    Serialises concurrent checkouts of the same order — the second thread
+    blocks until the first completes.
+    """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT paid, items, user_id, total_cost FROM orders WHERE id = %s FOR UPDATE",
@@ -205,32 +173,6 @@ def db_advance_saga(conn, saga_id, new_state):
         )
 
 # ---------------------------------------------------------------------------
-# DB helpers — idempotency (for SAGA mode)
-# ---------------------------------------------------------------------------
-
-def check_saga_idempotency(conn, idem_key):
-    if not idem_key:
-        return None
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT status_code, body FROM idempotency_keys WHERE key = %s",
-            (idem_key,),
-        )
-        row = cur.fetchone()
-    return (row[0], row[1]) if row else None
-
-
-def save_saga_idempotency(conn, idem_key, status_code, body):
-    if not idem_key:
-        return
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO idempotency_keys (key, status_code, body) "
-            "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
-            (idem_key, status_code, body),
-        )
-
-# ---------------------------------------------------------------------------
 # Flask HTTP endpoints (shared by both modes)
 # ---------------------------------------------------------------------------
 
@@ -248,10 +190,7 @@ def create_order(user_id: str):
 
 @app.post("/batch_init/<n>/<n_items>/<n_users>/<item_price>")
 def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
-    n = int(n)
-    n_items = int(n_items)
-    n_users = int(n_users)
-    item_price = int(item_price)
+    n, n_items, n_users, item_price = int(n), int(n_items), int(n_users), int(item_price)
     cur = g.conn.cursor()
     for i in range(n):
         user_id = str(random.randint(0, n_users - 1))
@@ -270,7 +209,10 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
 
 @app.get("/find/<order_id>")
 def find_order(order_id: str):
-    order = get_order_from_db(order_id)
+    try:
+        order = db_get_order(g.conn, order_id)
+    except ValueError as exc:
+        abort(400, str(exc))
     return jsonify(
         {
             "order_id": order_id,
@@ -319,10 +261,15 @@ def health():
     return jsonify({"status": "healthy"})
 
 # ---------------------------------------------------------------------------
-# HTTP helpers (used in TPC mode)
+# HTTP helpers (used in TPC mode for inter-service calls)
 # ---------------------------------------------------------------------------
 
 def send_post_request(url: str, idempotency_key: str = None, max_retries: int = 3):
+    """POST with exponential backoff: 100ms, 200ms, 400ms.
+
+    2xx and 4xx are terminal (business success or business failure — no retry).
+    5xx triggers retry because it may be a transient infrastructure issue.
+    """
     headers = {}
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
@@ -343,11 +290,11 @@ def send_post_request(url: str, idempotency_key: str = None, max_retries: int = 
                 f"Retry {attempt + 1}/{max_retries} for {url} failed: {e}"
             )
             if attempt == max_retries:
-                abort(400, REQ_ERROR_STR)
+                abort(400, "Requests error")
         if attempt < max_retries:
             wait = 0.1 * (2**attempt)
             time.sleep(wait)
-    abort(400, REQ_ERROR_STR)
+    abort(400, "Requests error")
 
 
 def send_get_request(url: str):
@@ -357,7 +304,7 @@ def send_get_request(url: str):
         duration = perf_counter() - start_time
         print(f"ORDER: GET request took {duration:.7f} seconds")
     except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
+        abort(400, "Requests error")
     else:
         return response
 
@@ -374,6 +321,14 @@ def checkout(order_id: str):
 
 # ============================================================================
 # TPC (Two-Phase Commit) — synchronous HTTP coordinator
+#
+# State machine: started -> preparing_stock -> preparing_payment ->
+#                committing -> committed (happy path)
+#                Any vote-NO or failure -> aborting -> aborted
+#
+# Every state transition is committed to PostgreSQL BEFORE the next external
+# call. This is the durable coordinator log — if the process crashes at any
+# point, recovery_tpc() reads the last persisted state and resumes.
 # ============================================================================
 
 def rollback_stock(removed_items: list[tuple[str, int]], transaction_id: str):
@@ -438,12 +393,14 @@ def checkout_tpc(order_id: str):
         cur.close()
         abort(400, "Order has no items!")
 
+    # --- Coordinator log: record transaction start ---
     cur.execute(
         "INSERT INTO transaction_log (txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) VALUES (%s, %s, %s, %s, %s, %s, %s)",
         (txn_id, order_id, "started", json.dumps([]), False, user_id, total_cost),
     )
     conn.commit()
 
+    # --- Phase 1: PREPARE stock (one item at a time) ---
     cur.execute(
         "UPDATE transaction_log SET status = 'preparing_stock' WHERE txn_id = %s",
         (txn_id,),
@@ -471,6 +428,7 @@ def checkout_tpc(order_id: str):
             cur.close()
             abort(400, "Failed to PREPARE stock")
 
+        # Persist which items are prepared so recovery knows what to abort
         prepared_stock.append([item_id, qty])
         cur.execute(
             "UPDATE transaction_log SET prepared_stock = %s WHERE txn_id = %s",
@@ -478,6 +436,7 @@ def checkout_tpc(order_id: str):
         )
         conn.commit()
 
+    # --- Phase 1: PREPARE payment ---
     cur.execute(
         "UPDATE transaction_log SET status = 'preparing_payment' WHERE txn_id = %s",
         (txn_id,),
@@ -508,6 +467,9 @@ def checkout_tpc(order_id: str):
     )
     conn.commit()
 
+    # --- Phase 2: COMMIT ---
+    # Once we persist 'committing', the decision is final. Even if we crash
+    # here, recovery_tpc() will see 'committing' and finish the commit.
     cur.execute(
         "UPDATE transaction_log SET status = 'committing' WHERE txn_id = %s", (txn_id,)
     )
@@ -525,6 +487,14 @@ def checkout_tpc(order_id: str):
 
 
 def recovery_tpc():
+    """Recover incomplete transactions on startup by reading the coordinator log.
+
+    Scans transaction_log for non-terminal states:
+      started, preparing_stock, preparing_payment, aborting -> abort
+      committing -> commit (the decision was already made)
+
+    This guarantees that no in-doubt transaction survives a restart.
+    """
     conn = conn_pool.getconn()
     try:
         cur = conn.cursor()
@@ -581,99 +551,16 @@ def recovery_tpc():
     finally:
         conn_pool.putconn(conn)
 
-def recovery_saga():
-    """Recover incomplete sagas by re-publishing the pending Kafka message.
-
-    Safe because all downstream consumers are idempotent — re-publishing
-    a subtract_batch, pay, or add_batch with the same idempotency key
-    returns the cached result without double-processing.
-    """
-    terminal_states = (
-        SagaState.COMPLETED, SagaState.STOCK_FAILED,
-        SagaState.PAYMENT_FAILED, SagaState.ROLLED_BACK,
-        SagaState.ROLLBACK_FAILED,
-    )
-    conn = conn_pool.getconn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, order_id, state, items_quantities FROM sagas "
-                "WHERE state NOT IN %s",
-                (terminal_states,),
-            )
-            rows = cur.fetchall()
-
-        if not rows:
-            app.logger.info("SAGA RECOVERY: No incomplete sagas found")
-            return
-
-        for saga_id, order_id, state, items_quantities in rows:
-            app.logger.warning(
-                "SAGA RECOVERY: Found incomplete saga %s in state %s (order %s)",
-                saga_id, state, order_id,
-            )
-
-            if isinstance(items_quantities, str):
-                items_quantities = json.loads(items_quantities)
-
-            batch_items = [
-                {"item_id": iid, "amount": qty}
-                for iid, qty in items_quantities.items()
-            ]
-
-            if state == SagaState.STOCK_REQUESTED:
-                corr_id = f"{saga_id}:stock:subtract_batch"
-                publish_internal_request(
-                    topic=INTERNAL_STOCK_TOPIC,
-                    correlation_id=corr_id,
-                    method="POST",
-                    path="/subtract_batch",
-                    body={"items": batch_items},
-                    headers={"Idempotency-Key": corr_id},
-                )
-
-            elif state == SagaState.PAYMENT_REQUESTED:
-                try:
-                    order = db_get_order(conn, order_id)
-                except ValueError:
-                    app.logger.error(
-                        "SAGA RECOVERY: Order %s not found for saga %s, skipping",
-                        order_id, saga_id,
-                    )
-                    continue
-                corr_id = f"{saga_id}:payment:pay"
-                publish_internal_request(
-                    topic=INTERNAL_PAYMENT_TOPIC,
-                    correlation_id=corr_id,
-                    method="POST",
-                    path=f"/pay/{order['user_id']}/{order['total_cost']}",
-                    headers={"Idempotency-Key": corr_id},
-                )
-
-            elif state == SagaState.ROLLBACK_REQUESTED:
-                corr_id = f"{saga_id}:stock:rollback"
-                publish_internal_request(
-                    topic=INTERNAL_STOCK_TOPIC,
-                    correlation_id=corr_id,
-                    method="POST",
-                    path="/add_batch",
-                    body={"items": batch_items},
-                    headers={"Idempotency-Key": corr_id},
-                )
-
-            app.logger.info(
-                "SAGA RECOVERY: Re-published message for saga %s (state=%s)",
-                saga_id, state,
-            )
-    finally:
-        conn_pool.putconn(conn)
-
 # ============================================================================
 # SAGA — synchronous HTTP fallback (used when Kafka is unavailable)
+#
+# A lightweight saga that uses direct HTTP calls instead of Kafka. Stock is
+# subtracted per-item, and if any step fails, previously subtracted items
+# are rolled back. No saga log is persisted because the HTTP request itself
+# is synchronous — there is nothing to recover.
 # ============================================================================
 
 def checkout_saga_http(order_id: str):
-    """Synchronous saga checkout via HTTP — fallback when not using Kafka gateway."""
     transaction_id = str(uuid.uuid4())
 
     cur = g.conn.cursor()
@@ -726,6 +613,18 @@ def checkout_saga_http(order_id: str):
 
 # ============================================================================
 # SAGA — Kafka-driven checkout (used when requests come via api-gateway)
+#
+# The order service is the saga orchestrator. When a checkout arrives via
+# the gateway Kafka consumer, it initiates a multi-step saga:
+#
+#   1. Publish subtract_batch to internal.stock
+#   2. On stock success -> publish pay to internal.payment
+#   3. On payment success -> mark order paid, saga COMPLETED
+#   3b. On payment failure -> publish add_batch to internal.stock (compensate)
+#   4. On rollback success -> saga ROLLED_BACK
+#
+# Each state transition is persisted to the sagas table before publishing
+# the next Kafka message. This is the durable saga log.
 # ============================================================================
 
 gateway_producer = None
@@ -736,20 +635,8 @@ _pending_price_lookups: dict[str, tuple[threading.Event, dict | None]] = {}
 _pending_price_lookups_lock = threading.Lock()
 
 
-def _build_kafka_producer(bootstrap_servers: str):
-    import kafka
-    return kafka.KafkaProducer(
-        bootstrap_servers=bootstrap_servers,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        key_serializer=lambda k: k.encode("utf-8") if k else None,
-        acks="all",
-        retries=3,
-        linger_ms=5,
-        batch_size=32_768,
-    )
-
-
 def publish_gateway_response(correlation_id: str, status_code: int, body: Any) -> None:
+    """Send a response back to the API gateway so it can unblock the HTTP client."""
     import kafka as kafka_mod
     payload = {"correlation_id": correlation_id, "status_code": status_code, "body": body}
     try:
@@ -762,6 +649,7 @@ def publish_gateway_response(correlation_id: str, status_code: int, body: Any) -
 def publish_internal_request(topic: str, correlation_id: str, method: str,
                              path: str, body: dict | None = None,
                              headers: dict | None = None) -> None:
+    """Publish a saga command to a participant service via the internal Kafka cluster."""
     import kafka as kafka_mod
     payload = {
         "correlation_id": correlation_id,
@@ -779,6 +667,11 @@ def publish_internal_request(topic: str, correlation_id: str, method: str,
 
 # ---------------------------------------------------------------------------
 # SAGA gateway message routing (Kafka consumer calls these)
+#
+# When running in SAGA mode, all HTTP requests are routed through the API
+# gateway -> Kafka -> this consumer. The routing logic here mirrors the
+# Flask endpoints above but operates on Kafka message payloads instead of
+# HTTP requests.
 # ---------------------------------------------------------------------------
 
 def handle_checkout_saga(conn, order_id, headers):
@@ -786,7 +679,7 @@ def handle_checkout_saga(conn, order_id, headers):
     idem_key = headers.get("Idempotency-Key") or headers.get("idempotency-key")
     correlation_id = headers.get("X-Correlation-Id") or headers.get("x-correlation-id")
 
-    cached = check_saga_idempotency(conn, idem_key)
+    cached = check_idempotency_kafka(conn, idem_key)
     if cached:
         return cached
 
@@ -917,7 +810,13 @@ def route_gateway_message(payload: dict, conn):
 
 
 def _fetch_item_price(item_id: str):
-    """Synchronously fetch item price from stock service via internal Kafka."""
+    """Synchronously fetch item price from stock service via internal Kafka.
+
+    Publishes a GET /find request to internal.stock and blocks until the
+    response arrives on internal.responses. The internal consumer thread
+    detects this correlation ID in _pending_price_lookups and sets the event
+    instead of routing it as a saga response.
+    """
     corr_id = str(uuid.uuid4())
     event = threading.Event()
 
@@ -942,6 +841,11 @@ def _fetch_item_price(item_id: str):
 
 # ---------------------------------------------------------------------------
 # Saga advancement handlers
+#
+# Each handler is called when a response arrives on internal.responses
+# matching the expected correlation ID suffix. The handler acquires a
+# FOR UPDATE lock on the saga row and verifies the current state before
+# advancing — this guards against duplicate or out-of-order Kafka messages.
 # ---------------------------------------------------------------------------
 
 def _on_stock_response(conn, saga, response):
@@ -972,7 +876,7 @@ def _on_payment_response(conn, saga, response):
     if response.get("status_code") == 200:
         try:
             db_mark_paid(conn, saga["order_id"])
-            save_saga_idempotency(conn, saga["idempotency_key"], 200, "Checkout successful")
+            save_idempotency_kafka(conn, saga["idempotency_key"], 200, "Checkout successful")
             db_advance_saga(conn, saga["id"], SagaState.COMPLETED)
             conn.commit()
         except Exception:
@@ -988,6 +892,7 @@ def _on_payment_response(conn, saga, response):
 
 
 def _fire_rollback(conn, saga):
+    """Fire compensating transaction: re-add stock that was subtracted."""
     rollback_corr_id = f"{saga['id']}:stock:rollback"
     items_quantities = saga["items_quantities"]
     batch_items = [{"item_id": iid, "amount": qty} for iid, qty in items_quantities.items()]
@@ -1025,6 +930,7 @@ def _on_rollback_response(conn, saga, response):
         )
 
 
+# Correlation ID suffix -> (handler function, expected saga state)
 _SAGA_HANDLERS = {
     ":stock:subtract_batch": (_on_stock_response, SagaState.STOCK_REQUESTED),
     ":payment:pay": (_on_payment_response, SagaState.PAYMENT_REQUESTED),
@@ -1033,9 +939,16 @@ _SAGA_HANDLERS = {
 
 
 def handle_internal_response(payload):
-    """Routes an internal.responses message to the correct saga handler."""
+    """Routes an internal.responses message to the correct saga handler.
+
+    First checks if this is a price-lookup response (non-saga). If not,
+    matches the correlation ID suffix to determine which saga step completed,
+    acquires a FOR UPDATE lock on the saga row, verifies state, and calls
+    the handler.
+    """
     correlation_id = payload.get("correlation_id", "")
 
+    # Check if this is a response to a synchronous price lookup (addItem)
     with _pending_price_lookups_lock:
         if correlation_id in _pending_price_lookups:
             event, _ = _pending_price_lookups[correlation_id]
@@ -1083,10 +996,111 @@ def handle_internal_response(payload):
         conn_pool.putconn(conn)
 
 # ---------------------------------------------------------------------------
+# SAGA recovery
+# ---------------------------------------------------------------------------
+
+def recovery_saga():
+    """Recover incomplete sagas by re-publishing the pending Kafka message.
+
+    Safe because all downstream consumers are idempotent — re-publishing
+    a subtract_batch, pay, or add_batch with the same idempotency key
+    returns the cached result without double-processing.
+    """
+    terminal_states = (
+        SagaState.COMPLETED, SagaState.STOCK_FAILED,
+        SagaState.PAYMENT_FAILED, SagaState.ROLLED_BACK,
+        SagaState.ROLLBACK_FAILED,
+    )
+    conn = conn_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, order_id, state, items_quantities FROM sagas "
+                "WHERE state NOT IN %s",
+                (terminal_states,),
+            )
+            rows = cur.fetchall()
+
+        if not rows:
+            app.logger.info("SAGA RECOVERY: No incomplete sagas found")
+            return
+
+        for saga_id, order_id, state, items_quantities in rows:
+            app.logger.warning(
+                "SAGA RECOVERY: Found incomplete saga %s in state %s (order %s)",
+                saga_id, state, order_id,
+            )
+
+            if isinstance(items_quantities, str):
+                items_quantities = json.loads(items_quantities)
+
+            batch_items = [
+                {"item_id": iid, "amount": qty}
+                for iid, qty in items_quantities.items()
+            ]
+
+            if state == SagaState.STOCK_REQUESTED:
+                corr_id = f"{saga_id}:stock:subtract_batch"
+                publish_internal_request(
+                    topic=INTERNAL_STOCK_TOPIC,
+                    correlation_id=corr_id,
+                    method="POST",
+                    path="/subtract_batch",
+                    body={"items": batch_items},
+                    headers={"Idempotency-Key": corr_id},
+                )
+
+            elif state == SagaState.PAYMENT_REQUESTED:
+                try:
+                    order = db_get_order(conn, order_id)
+                except ValueError:
+                    app.logger.error(
+                        "SAGA RECOVERY: Order %s not found for saga %s, skipping",
+                        order_id, saga_id,
+                    )
+                    continue
+                corr_id = f"{saga_id}:payment:pay"
+                publish_internal_request(
+                    topic=INTERNAL_PAYMENT_TOPIC,
+                    correlation_id=corr_id,
+                    method="POST",
+                    path=f"/pay/{order['user_id']}/{order['total_cost']}",
+                    headers={"Idempotency-Key": corr_id},
+                )
+
+            elif state == SagaState.ROLLBACK_REQUESTED:
+                corr_id = f"{saga_id}:stock:rollback"
+                publish_internal_request(
+                    topic=INTERNAL_STOCK_TOPIC,
+                    correlation_id=corr_id,
+                    method="POST",
+                    path="/add_batch",
+                    body={"items": batch_items},
+                    headers={"Idempotency-Key": corr_id},
+                )
+
+            app.logger.info(
+                "SAGA RECOVERY: Re-published message for saga %s (state=%s)",
+                saga_id, state,
+            )
+    finally:
+        conn_pool.putconn(conn)
+
+# ---------------------------------------------------------------------------
 # Kafka consumer loops (SAGA mode only)
 # ---------------------------------------------------------------------------
 
 def start_gateway_consumer():
+    """Consume messages from gateway.orders and route them to handlers.
+
+    Unlike stock/payment which use the generic run_consumer_loop, the order
+    service needs custom logic: checkout returns None (response sent async
+    by saga handlers), while other operations return a result immediately.
+
+    auto_offset_reset="earliest" ensures no messages are missed after a
+    restart — in contrast to the gateway which uses "latest" because it only
+    cares about responses to currently in-flight HTTP requests.
+    """
     import kafka
     while True:
         try:
@@ -1137,6 +1151,7 @@ def start_gateway_consumer():
 
 
 def start_internal_consumer():
+    """Consume saga responses from internal.responses and advance saga state."""
     import kafka
     while True:
         try:
@@ -1166,6 +1181,12 @@ def start_internal_consumer():
 
 # ---------------------------------------------------------------------------
 # Startup
+#
+# In SAGA mode, gunicorn runs with -w 1 (single worker) because the Kafka
+# consumer threads and saga state are in-process. Multiple workers would
+# each spin up their own consumers, creating duplicate message processing.
+# In TPC mode, multiple workers are safe because all state coordination
+# happens via the database.
 # ---------------------------------------------------------------------------
 
 with app.app_context():
@@ -1175,8 +1196,8 @@ with app.app_context():
         except Exception as e:
             app.logger.warning(f"RECOVERY: Error during recovery: {e}")
     elif TRANSACTION_MODE == "SAGA":
-        gateway_producer = _build_kafka_producer(GATEWAY_KAFKA)
-        internal_producer = _build_kafka_producer(INTERNAL_KAFKA)
+        gateway_producer = build_producer(GATEWAY_KAFKA)
+        internal_producer = build_producer(INTERNAL_KAFKA)
         try:
             recovery_saga()
         except Exception as e:
@@ -1188,6 +1209,4 @@ with app.app_context():
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    gunicorn_logger = logging.getLogger("gunicorn.error")
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+    setup_gunicorn_logging(app)

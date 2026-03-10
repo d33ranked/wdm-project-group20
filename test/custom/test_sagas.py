@@ -8,46 +8,10 @@ and coordinator crash recovery via saga state persistence.
 
 import json
 import subprocess
-import threading
 import time
 import uuid
 
-import requests
-
-from run import api, check, json_field, PROJECT_ROOT, BASE_URL
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def _docker(cmd: str):
-    """Run a docker command silently."""
-    subprocess.run(
-        cmd, shell=True, cwd=PROJECT_ROOT,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-
-
-def _docker_exec_sql(container: str, db: str, sql: str):
-    """Execute a SQL statement inside a postgres container."""
-    subprocess.run(
-        ["docker", "exec", container, "psql", "-U", "user", "-d", db, "-c", sql],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-
-
-def _wait_for_service(probe_path: str, timeout: int = 60):
-    """Poll until a service endpoint responds with a non-5xx status."""
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            r = requests.get(f"{BASE_URL}{probe_path}", timeout=3)
-            if r.status_code < 500:
-                return True
-        except Exception:
-            pass
-        time.sleep(2)
-    return False
+from run import api, check, json_field, PROJECT_ROOT, docker_cmd, docker_exec_sql, wait_for_service
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +97,7 @@ def test_participant_crash_recovery():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    _docker(f"docker stop {CONTAINER}")
+    docker_cmd(f"docker stop {CONTAINER}")
     subprocess.Popen(
         f"sleep 3 && docker start {CONTAINER}",
         shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -146,7 +110,7 @@ def test_participant_crash_recovery():
     check("Checkout Completed After Stock Service Recovered — Kafka Message Persisted And Processed",
           r.status_code == 200, f"got {r.status_code}")
 
-    _wait_for_service(f"/stock/find/{item}")
+    wait_for_service(f"/stock/find/{item}")
     stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
     credit = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
 
@@ -184,7 +148,7 @@ def test_coordinator_crash_recovery():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    _docker(f"docker stop {ORDER_CONTAINER}")
+    docker_cmd(f"docker stop {ORDER_CONTAINER}")
 
     saga_id = str(uuid.uuid4())
     items_quantities = json.dumps({item: ITEM_QTY})
@@ -192,21 +156,21 @@ def test_coordinator_crash_recovery():
     new_stock = STOCK - ITEM_QTY
     cached_body = json.dumps({"updated_stock": {item: new_stock}})
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
         f"INSERT INTO sagas (id, order_id, state, items_quantities, "
         f"original_correlation_id) VALUES "
         f"('{saga_id}', '{order}', 'STOCK_REQUESTED', '{items_quantities}', 'recovery-test')")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
         f"UPDATE items SET stock = stock - {ITEM_QTY} WHERE id = '{item}'")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
         f"INSERT INTO idempotency_keys (key, status_code, body) VALUES "
         f"('{stock_idem_key}', 200, '{cached_body}')")
 
-    _docker(f"docker start {ORDER_CONTAINER}")
+    docker_cmd(f"docker start {ORDER_CONTAINER}")
 
-    _wait_for_service(f"/orders/find/{order}", timeout=90)
+    wait_for_service(f"/orders/find/{order}", timeout=90)
     time.sleep(15)
 
     stock_val = json_field(api("GET", f"/stock/find/{item}"), "stock")

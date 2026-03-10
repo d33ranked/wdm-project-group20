@@ -1,23 +1,44 @@
+"""
+Stock Service
+=============
+Manages item inventory (stock levels and prices).
+
+Supports two transaction modes controlled by the TRANSACTION_MODE env var:
+
+  TPC  — Flask HTTP endpoints for CRUD + 2PC prepare/commit/abort.
+         The order service (coordinator) calls these endpoints directly
+         via Nginx during checkout.
+
+  SAGA — Same Flask endpoints for direct CRUD, plus Kafka consumers that
+         handle saga commands (subtract_batch, add_batch) from the order
+         service orchestrator. Batch operations are atomic: all items
+         succeed or none do.
+"""
+
+# gevent monkey-patching must happen before any other imports so that
+# stdlib blocking calls (socket, time.sleep, threading) are replaced
+# with cooperative greenlet-friendly versions.
 import gevent.monkey
 gevent.monkey.patch_all()
 
 import os
 import json
-import time
 import uuid
-import atexit
-import hashlib
+import time
 import logging
 import threading
-from typing import Any
 
 import psycopg2
-import psycopg2.pool
 
-from time import perf_counter
 from flask import Flask, jsonify, abort, request, Response, g
 
-DB_ERROR_STR = "DB error"
+from common.db import create_conn_pool, setup_flask_lifecycle, setup_gunicorn_logging
+from common.idempotency import (
+    check_idempotency_http, save_idempotency_http,
+    check_idempotency_kafka, save_idempotency_kafka,
+)
+from common.kafka_helpers import build_producer, publish_response, run_consumer_loop
+
 TRANSACTION_MODE = os.environ.get("TRANSACTION_MODE", "TPC")
 
 GATEWAY_KAFKA = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka-external:9092")
@@ -31,125 +52,8 @@ INTERNAL_RESPONSE_TOPIC = "internal.responses"
 app = Flask("stock-service")
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# DB pool
-# ---------------------------------------------------------------------------
-
-def create_conn_pool(retries=10, delay=2):
-    for attempt in range(retries):
-        try:
-            return psycopg2.pool.ThreadedConnectionPool(
-                minconn=10,
-                maxconn=100,
-                host=os.environ["POSTGRES_HOST"],
-                port=int(os.environ["POSTGRES_PORT"]),
-                dbname=os.environ["POSTGRES_DB"],
-                user=os.environ["POSTGRES_USER"],
-                password=os.environ["POSTGRES_PASSWORD"],
-            )
-        except psycopg2.OperationalError:
-            if attempt < retries - 1:
-                print(
-                    f"STOCK: PostgreSQL not ready, retrying in {delay}s... (attempt {attempt+1}/{retries})"
-                )
-                time.sleep(delay)
-            else:
-                raise
-
-
-conn_pool = create_conn_pool()
-
-
-def close_db_connection():
-    conn_pool.closeall()
-
-
-atexit.register(close_db_connection)
-
-# ---------------------------------------------------------------------------
-# Flask request lifecycle
-# ---------------------------------------------------------------------------
-
-@app.before_request
-def start_timer():
-    g.start_time = perf_counter()
-    g.conn = conn_pool.getconn()
-
-
-@app.after_request
-def log_response(response):
-    duration = perf_counter() - g.start_time
-    print(f"STOCK: Request took {duration:.7f} seconds")
-    return response
-
-
-@app.teardown_request
-def teardown_request(exception):
-    conn = g.pop("conn", None)
-    if conn is not None:
-        if exception:
-            conn.rollback()
-        else:
-            conn.commit()
-        conn_pool.putconn(conn)
-
-# ---------------------------------------------------------------------------
-# Idempotency helpers
-# ---------------------------------------------------------------------------
-
-def idempotency_token(key: str) -> int:
-    return int(hashlib.md5(key.encode()).hexdigest(), 16) % (2**31)
-
-
-def check_idempotency():
-    idem_key = request.headers.get("Idempotency-Key")
-    if not idem_key:
-        return None
-    cur = g.conn.cursor()
-    cur.execute("SELECT pg_advisory_xact_lock(%s)", (idempotency_token(idem_key),))
-    cur.execute(
-        "SELECT status_code, body FROM idempotency_keys WHERE key = %s", (idem_key,)
-    )
-    row = cur.fetchone()
-    cur.close()
-    if row is not None:
-        return Response(row[1], status=row[0])
-    return None
-
-
-def save_idempotency(status_code, body):
-    idem_key = request.headers.get("Idempotency-Key")
-    if not idem_key:
-        return
-    cur = g.conn.cursor()
-    cur.execute(
-        "INSERT INTO idempotency_keys (key, status_code, body) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
-        (idem_key, status_code, body),
-    )
-    cur.close()
-
-
-def check_idempotency_kafka(conn, idem_key):
-    if not idem_key:
-        return None
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT status_code, body FROM idempotency_keys WHERE key = %s",
-            (idem_key,),
-        )
-        row = cur.fetchone()
-    return (row[0], row[1]) if row else None
-
-
-def save_idempotency_kafka(conn, idem_key, status_code, body):
-    if not idem_key:
-        return
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO idempotency_keys (key, status_code, body) "
-            "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
-            (idem_key, status_code, body),
-        )
+conn_pool = create_conn_pool("STOCK")
+setup_flask_lifecycle(app, conn_pool, "STOCK")
 
 # ---------------------------------------------------------------------------
 # DB helpers
@@ -181,9 +85,7 @@ def create_item(price: int):
 
 @app.post("/batch_init/<n>/<starting_stock>/<item_price>")
 def batch_init_users(n: int, starting_stock: int, item_price: int):
-    n = int(n)
-    starting_stock = int(starting_stock)
-    item_price = int(item_price)
+    n, starting_stock, item_price = int(n), int(starting_stock), int(item_price)
     cur = g.conn.cursor()
     for i in range(n):
         cur.execute(
@@ -203,9 +105,10 @@ def find_item(item_id: str):
 
 @app.post("/add/<item_id>/<amount>")
 def add_stock(item_id: str, amount: int):
-    cached = check_idempotency()
+    idem_key = request.headers.get("Idempotency-Key")
+    cached = check_idempotency_http(g.conn, idem_key)
     if cached is not None:
-        return cached
+        return Response(cached[1], status=cached[0])
 
     cur = g.conn.cursor()
     cur.execute("SELECT stock FROM items WHERE id = %s FOR UPDATE", (item_id,))
@@ -221,15 +124,16 @@ def add_stock(item_id: str, amount: int):
     cur.close()
 
     body = f"Item: {item_id} stock updated to: {new_stock}"
-    save_idempotency(200, body)
+    save_idempotency_http(g.conn, idem_key, 200, body)
     return Response(body, status=200)
 
 
 @app.post("/subtract/<item_id>/<amount>")
 def remove_stock(item_id: str, amount: int):
-    cached = check_idempotency()
+    idem_key = request.headers.get("Idempotency-Key")
+    cached = check_idempotency_http(g.conn, idem_key)
     if cached is not None:
-        return cached
+        return Response(cached[1], status=cached[0])
 
     cur = g.conn.cursor()
     cur.execute("SELECT stock FROM items WHERE id = %s FOR UPDATE", (item_id,))
@@ -237,8 +141,7 @@ def remove_stock(item_id: str, amount: int):
     if row is None:
         cur.close()
         abort(400, f"Item: {item_id} not found!")
-    current_stock = row[0]
-    if current_stock - int(amount) < 0:
+    if row[0] - int(amount) < 0:
         cur.close()
         abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
     cur.execute(
@@ -249,7 +152,7 @@ def remove_stock(item_id: str, amount: int):
     cur.close()
 
     body = f"Item: {item_id} stock updated to: {new_stock}"
-    save_idempotency(200, body)
+    save_idempotency_http(g.conn, idem_key, 200, body)
     return Response(body, status=200)
 
 
@@ -259,6 +162,17 @@ def health():
 
 # ---------------------------------------------------------------------------
 # 2PC endpoints (TPC mode)
+#
+# Pessimistic reservation pattern: PREPARE immediately deducts stock and
+# records the reservation. This makes the resource unavailable to other
+# transactions, which is the desired isolation behaviour.
+#
+# COMMIT simply deletes the reservation record — the deduction is already
+# in place, so commit is just cleanup. This makes commit inherently
+# idempotent: committing a non-existent record is a no-op DELETE.
+#
+# ABORT reads the reservation, restores the stock, then deletes the record.
+# Also idempotent: aborting a non-existent record changes nothing.
 # ---------------------------------------------------------------------------
 
 @app.post("/prepare/<txn_id>/<item_id>/<quantity>")
@@ -279,8 +193,7 @@ def prepare_transaction(txn_id: str, item_id: str, quantity: int):
     if row is None:
         cur.close()
         abort(400, f"Item: {item_id} not found!")
-    current_stock = row[0]
-    if current_stock < quantity:
+    if row[0] < quantity:
         cur.close()
         abort(400, f"Item: {item_id} has insufficient stock!")
 
@@ -321,6 +234,12 @@ def abort_transaction(txn_id: str):
 
 
 def recovery_tpc():
+    """Auto-abort prepared transactions older than 5 minutes on startup.
+
+    Safety net for the case where the coordinator (order service) crashed
+    and never sent commit/abort. Without this, stock would remain reserved
+    indefinitely.
+    """
     conn = conn_pool.getconn()
     try:
         cur = conn.cursor()
@@ -352,6 +271,10 @@ def recovery_tpc():
 
 # ---------------------------------------------------------------------------
 # Batch operations (SAGA mode — atomic multi-item subtract/add)
+#
+# These are used by saga commands (subtract_batch / add_batch). All items
+# are locked in sorted order (ORDER BY id) to prevent deadlocks when
+# concurrent transactions touch overlapping item sets.
 # ---------------------------------------------------------------------------
 
 def db_subtract_stock_batch(conn, items):
@@ -400,7 +323,12 @@ def db_add_stock_batch(conn, items):
     return results
 
 # ---------------------------------------------------------------------------
-# Kafka consumer routing (SAGA mode)
+# Kafka message routing (SAGA mode)
+#
+# Mirrors the Flask routing logic but for Kafka messages. This duplication
+# is inherent to the architecture: Kafka messages arrive as JSON envelopes
+# with method/path fields that must be manually dispatched, since Flask's
+# URL routing only applies to HTTP requests.
 # ---------------------------------------------------------------------------
 
 def route_kafka_message(payload, conn):
@@ -526,77 +454,6 @@ def route_kafka_message(payload, conn):
     return 404, {"error": f"No handler for {method} {path}"}
 
 # ---------------------------------------------------------------------------
-# Kafka consumer loops (SAGA mode)
-# ---------------------------------------------------------------------------
-
-def _build_kafka_producer(bootstrap_servers):
-    import kafka
-    return kafka.KafkaProducer(
-        bootstrap_servers=bootstrap_servers,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        key_serializer=lambda k: k.encode("utf-8") if k else None,
-        acks="all", retries=3, linger_ms=5, batch_size=32_768,
-    )
-
-
-def _publish_response(producer, response_topic, correlation_id, status_code, body):
-    import kafka as kafka_mod
-    payload = {"correlation_id": correlation_id, "status_code": status_code, "body": body}
-    try:
-        producer.send(response_topic, key=correlation_id, value=payload)
-        producer.flush(timeout=5)
-    except kafka_mod.errors.KafkaError as exc:
-        logger.error("Failed to publish response for %s: %s", correlation_id, exc)
-
-
-def _run_consumer(consume_bootstrap, consume_topic, consume_group, producer, response_topic):
-    import kafka
-    while True:
-        try:
-            consumer = kafka.KafkaConsumer(
-                consume_topic,
-                bootstrap_servers=consume_bootstrap,
-                group_id=consume_group,
-                auto_offset_reset="earliest",
-                enable_auto_commit=False,
-                value_deserializer=lambda m: json.loads(m.decode("utf-8")),
-            )
-            logger.info("Stock consumer started on '%s' → replies to '%s'", consume_topic, response_topic)
-
-            for message in consumer:
-                payload = message.value
-                correlation_id = payload.get("correlation_id")
-                if not correlation_id:
-                    try:
-                        consumer.commit()
-                    except Exception:
-                        pass
-                    continue
-
-                conn = conn_pool.getconn()
-                try:
-                    status_code, body = route_kafka_message(payload, conn)
-                except Exception as exc:
-                    logger.error("Unhandled error processing %s: %s", correlation_id, exc, exc_info=True)
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                    status_code, body = 500, {"error": "Internal server error"}
-                finally:
-                    conn_pool.putconn(conn)
-
-                _publish_response(producer, response_topic, correlation_id, status_code, body)
-                try:
-                    consumer.commit()
-                except Exception:
-                    pass
-
-        except Exception as exc:
-            logger.error("Stock consumer on '%s' crashed, reconnecting in 3s: %s", consume_topic, exc)
-            time.sleep(3)
-
-# ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
 
@@ -607,20 +464,22 @@ with app.app_context():
         except Exception as e:
             app.logger.warning(f"RECOVERY STOCK: Error during recovery: {e}")
     elif TRANSACTION_MODE == "SAGA":
-        gateway_producer = _build_kafka_producer(GATEWAY_KAFKA)
-        internal_producer = _build_kafka_producer(INTERNAL_KAFKA)
+        gateway_producer = build_producer(GATEWAY_KAFKA)
+        internal_producer = build_producer(INTERNAL_KAFKA)
 
         threading.Thread(
-            target=_run_consumer,
-            args=(INTERNAL_KAFKA, INTERNAL_STOCK_TOPIC, "stock-service-internal",
-                  internal_producer, INTERNAL_RESPONSE_TOPIC),
+            target=run_consumer_loop,
+            args=(conn_pool, INTERNAL_KAFKA, INTERNAL_STOCK_TOPIC,
+                  "stock-service-internal", internal_producer,
+                  INTERNAL_RESPONSE_TOPIC, route_kafka_message, "Stock"),
             daemon=True, name="internal-consumer",
         ).start()
 
         threading.Thread(
-            target=_run_consumer,
-            args=(GATEWAY_KAFKA, GATEWAY_STOCK_TOPIC, "stock-service-gateway",
-                  gateway_producer, GATEWAY_RESPONSE_TOPIC),
+            target=run_consumer_loop,
+            args=(conn_pool, GATEWAY_KAFKA, GATEWAY_STOCK_TOPIC,
+                  "stock-service-gateway", gateway_producer,
+                  GATEWAY_RESPONSE_TOPIC, route_kafka_message, "Stock"),
             daemon=True, name="gateway-consumer",
         ).start()
 
@@ -629,6 +488,4 @@ with app.app_context():
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    gunicorn_logger = logging.getLogger("gunicorn.error")
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+    setup_gunicorn_logging(app)

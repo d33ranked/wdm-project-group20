@@ -1,6 +1,8 @@
 services:
   api-gateway:
-    build: ./gateway
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
     image: gateway:latest
     restart: on-failure
     ports:
@@ -28,7 +30,9 @@ services:
       - payment-service
 
   order-service:
-    build: ./order
+    build:
+      context: .
+      dockerfile: order/Dockerfile
     image: order:latest
     restart: on-failure
     environment:
@@ -54,7 +58,9 @@ services:
       - ./order/init.sql:/docker-entrypoint-initdb.d/init.sql
 
   stock-service:
-    build: ./stock
+    build:
+      context: .
+      dockerfile: stock/Dockerfile
     image: stock:latest
     restart: on-failure
     environment:
@@ -79,7 +85,9 @@ services:
       - ./stock/init.sql:/docker-entrypoint-initdb.d/init.sql
 
   payment-service:
-    build: ./payment
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
     image: payment:latest
     restart: on-failure
     environment:

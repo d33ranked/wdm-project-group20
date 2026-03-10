@@ -35,10 +35,3 @@ CREATE TABLE IF NOT EXISTS sagas (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS saga_events (
-    id SERIAL PRIMARY KEY,
-    saga_id TEXT NOT NULL REFERENCES sagas(id),
-    event TEXT NOT NULL,
-    payload JSONB,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
-);

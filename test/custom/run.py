@@ -40,6 +40,39 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 # ---------------------------------------------------------------------------
 # Shared test harness — imported by test_common, test_tpc, test_sagas
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Docker helpers (shared by test_tpc and test_sagas)
+# ---------------------------------------------------------------------------
+
+def docker_cmd(cmd: str):
+    """Run a docker command silently."""
+    subprocess.run(
+        cmd, shell=True, cwd=PROJECT_ROOT,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def docker_exec_sql(container: str, db: str, sql: str):
+    """Execute a SQL statement inside a postgres container."""
+    subprocess.run(
+        ["docker", "exec", container, "psql", "-U", "user", "-d", db, "-c", sql],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def wait_for_service(probe_path: str, timeout: int = 60):
+    """Poll until a service endpoint responds with a non-5xx status."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            r = requests.get(f"{BASE_URL}{probe_path}", timeout=3)
+            if r.status_code < 500:
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
 _pass_count = 0
 _fail_count = 0
 

@@ -2,11 +2,12 @@ FROM python:3.12-slim
 
 WORKDIR /home/flask-app
 
-COPY ./requirements.txt .
-
+COPY order/requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY . .
+COPY common/ ./common/
+COPY order/app.py .
+COPY order/init.sql .
 
 ENV PYTHONUNBUFFERED=1
 

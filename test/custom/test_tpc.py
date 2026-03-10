@@ -11,34 +11,7 @@ import subprocess
 import threading
 import time
 
-import requests
-
-from run import api, check, json_field, PROJECT_ROOT, BASE_URL
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def _docker(cmd: str):
-    """Run a docker command silently."""
-    subprocess.run(
-        cmd, shell=True, cwd=PROJECT_ROOT,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-
-
-def _wait_for_service(probe_path: str, timeout: int = 60):
-    """Poll until a service endpoint responds with a non-5xx status."""
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            r = requests.get(f"{BASE_URL}{probe_path}", timeout=3)
-            if r.status_code < 500:
-                return True
-        except Exception:
-            pass
-        time.sleep(2)
-    return False
+from run import api, check, json_field, PROJECT_ROOT, docker_cmd, wait_for_service
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +329,7 @@ def test_participant_crash_recovery():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    _docker(f"docker stop {CONTAINER}")
+    docker_cmd(f"docker stop {CONTAINER}")
     subprocess.Popen(
         f"sleep 3 && docker start {CONTAINER}",
         shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -369,7 +342,7 @@ def test_participant_crash_recovery():
     check("Checkout Completed After Stock Service Recovered — Order Service Retried Successfully",
           r.status_code == 200, f"got {r.status_code}")
 
-    _wait_for_service(f"/stock/find/{item}")
+    wait_for_service(f"/stock/find/{item}")
     stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
     credit = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
 
@@ -411,14 +384,14 @@ def test_coordinator_crash_recovery():
     t.start()
 
     time.sleep(0.3)
-    _docker(f"docker kill {ORDER_CONTAINER}")
+    docker_cmd(f"docker kill {ORDER_CONTAINER}")
 
     checkout_done.wait(timeout=35)
 
     time.sleep(2)
-    _docker(f"docker start {ORDER_CONTAINER}")
+    docker_cmd(f"docker start {ORDER_CONTAINER}")
 
-    _wait_for_service(f"/orders/find/{order}", timeout=90)
+    wait_for_service(f"/orders/find/{order}", timeout=90)
     time.sleep(5)
 
     stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
