@@ -6,8 +6,7 @@ COPY stock/requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY common/ ./common/
-COPY stock/app.py .
-COPY stock/init.sql .
+COPY stock/app.py stock/tpc.py stock/saga.py ./
 
 ENV PYTHONUNBUFFERED=1
 

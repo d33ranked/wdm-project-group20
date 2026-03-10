@@ -6,8 +6,7 @@ COPY order/requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY common/ ./common/
-COPY order/app.py .
-COPY order/init.sql .
+COPY order/app.py order/db.py order/tpc.py order/saga.py ./
 
 ENV PYTHONUNBUFFERED=1
 

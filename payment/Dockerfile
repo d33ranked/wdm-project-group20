@@ -6,8 +6,7 @@ COPY payment/requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY common/ ./common/
-COPY payment/app.py .
-COPY payment/init.sql .
+COPY payment/app.py payment/tpc.py payment/saga.py ./
 
 ENV PYTHONUNBUFFERED=1
 
