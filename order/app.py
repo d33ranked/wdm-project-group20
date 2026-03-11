@@ -590,7 +590,7 @@ def recovery_saga():
     """
     terminal_states = (
         SagaState.COMPLETED, SagaState.STOCK_FAILED,
-        SagaState.PAYMENT_FAILED, SagaState.ROLLED_BACK,
+        SagaState.PAYMENT_FAILED, SagaState.ROLLED_BACK, # TODO payment failed is never set anywhere
         SagaState.ROLLBACK_FAILED,
     )
     conn = conn_pool.getconn()
