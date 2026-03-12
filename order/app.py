@@ -3,6 +3,7 @@ gevent.monkey.patch_all()
 
 import os
 import json
+import time
 import uuid
 import random
 import logging
@@ -25,6 +26,19 @@ logger = logging.getLogger(__name__)
 
 conn_pool = create_conn_pool("ORDER")
 setup_flask_lifecycle(app, conn_pool, "ORDER")
+
+
+@app.before_request
+def _start_timer():
+    g.start_time = time.time()
+
+
+@app.after_request
+def _log_request_time(response):
+    duration_ms = (time.time() - g.start_time) * 1000
+    print(f"[ORDER] {request.method} {request.path} {response.status_code} {duration_ms:.0f}ms", flush=True)
+    return response
+
 
 # ---------------------------------------------------------------------------
 # Flask Endpoints
