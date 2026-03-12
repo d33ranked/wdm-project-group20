@@ -148,6 +148,8 @@ class HAConnectionPool:
     def _handle_failover(self):
         """
         Handle failover by discovering the new primary and recreating the pool.
+        Retry budget is sized to cover Patroni's worst-case failover time:
+          ttl (4s) + retry_timeout (3s) + buffer = ~20 retries x 0.5s = 10s
         """
         print(f"{self.service_name}: Initiating failover...")
         
@@ -155,7 +157,7 @@ class HAConnectionPool:
         time.sleep(0.5)
         
         # Recreate pool with new primary
-        self._create_pool(retries=10, delay=0.5)
+        self._create_pool(retries=20, delay=0.5)
         
         print(f"{self.service_name}: Failover complete, new primary: {self._current_primary}")
 
