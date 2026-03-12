@@ -11,7 +11,7 @@ import logging
 import psycopg2
 import psycopg2.pool
 
-from db_utils import create_ha_pool
+from db_utils import create_ha_pool, retry_on_db_failure
 
 from time import perf_counter
 from flask import Flask, jsonify, abort, request, Response, g
@@ -57,7 +57,7 @@ atexit.register(close_db_connection)
 
 
 def get_user_from_db(user_id: str):
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute("SELECT credit FROM users WHERE id = %s", (user_id,))
     row = cur.fetchone()
     cur.close()
@@ -67,19 +67,21 @@ def get_user_from_db(user_id: str):
 
 
 @app.post("/create_user")
+@retry_on_db_failure(conn_pool)
 def create_user():
     key = str(uuid.uuid4())
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute("INSERT INTO users (id, credit) VALUES (%s, %s)", (key, 0))
     cur.close()
     return jsonify({"user_id": key})
 
 
 @app.post("/batch_init/<n>/<starting_money>")
+@retry_on_db_failure(conn_pool)
 def batch_init_users(n: int, starting_money: int):
     n = int(n)
     starting_money = int(starting_money)
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     for i in range(n):
         cur.execute(
             "INSERT INTO users (id, credit) VALUES (%s, %s) "
@@ -91,12 +93,14 @@ def batch_init_users(n: int, starting_money: int):
 
 
 @app.get("/find_user/<user_id>")
+@retry_on_db_failure(conn_pool)
 def find_user(user_id: str):
     user = get_user_from_db(user_id)
     return jsonify({"user_id": user_id, "credit": user["credit"]})
 
 
 @app.post("/add_funds/<user_id>/<amount>")
+@retry_on_db_failure(conn_pool)
 def add_credit(user_id: str, amount: int):
     # check idempotency key
     cached = check_idempotency()
@@ -104,7 +108,7 @@ def add_credit(user_id: str, amount: int):
         return cached
 
     # add credit
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute("SELECT credit FROM users WHERE id = %s FOR UPDATE", (user_id,))
     row = cur.fetchone()
     if row is None:
@@ -124,6 +128,7 @@ def add_credit(user_id: str, amount: int):
 
 
 @app.post("/pay/<user_id>/<amount>")
+@retry_on_db_failure(conn_pool)
 def remove_credit(user_id: str, amount: int):
     # check idempotency key
     cached = check_idempotency()
@@ -131,7 +136,7 @@ def remove_credit(user_id: str, amount: int):
         return cached
 
     # remove credit
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute("SELECT credit FROM users WHERE id = %s FOR UPDATE", (user_id,))
     row = cur.fetchone()
     if row is None:
@@ -155,9 +160,10 @@ def remove_credit(user_id: str, amount: int):
 
 
 @app.post("/prepare/<txn_id>/<user_id>/<amount>")
+@retry_on_db_failure(conn_pool)
 def prepare_transaction(txn_id: str, user_id: str, amount: int):
     amount = int(amount)
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
 
     # check if the transaction is already prepared
     cur.execute("SELECT 1 FROM prepared_transactions WHERE txn_id = %s", (txn_id,))
@@ -192,8 +198,9 @@ def prepare_transaction(txn_id: str, user_id: str, amount: int):
 
 
 @app.post("/commit/<txn_id>")
+@retry_on_db_failure(conn_pool)
 def commit_transaction(txn_id: str):
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
 
     # remove the rollback records
     cur.execute("DELETE FROM prepared_transactions WHERE txn_id = %s", (txn_id,))
@@ -202,8 +209,9 @@ def commit_transaction(txn_id: str):
 
 
 @app.post("/abort/<txn_id>")
+@retry_on_db_failure(conn_pool)
 def abort_transaction(txn_id: str):
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
 
     # fetch (only one) rollback record for this transaction
     cur.execute(
@@ -239,7 +247,7 @@ def check_idempotency():
     idem_key = request.headers.get("Idempotency-Key")
     if not idem_key:
         return None
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute("SELECT pg_advisory_xact_lock(%s)", (idempotency_token(idem_key),))
     cur.execute(
         "SELECT status_code, body FROM idempotency_keys WHERE key = %s", (idem_key,)
@@ -256,7 +264,7 @@ def save_idempotency(status_code, body):
     idem_key = request.headers.get("Idempotency-Key")
     if not idem_key:
         return
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute(
         "INSERT INTO idempotency_keys (key, status_code, body) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
         (idem_key, status_code, body),
