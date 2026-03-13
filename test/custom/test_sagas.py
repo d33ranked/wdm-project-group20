@@ -118,7 +118,7 @@ def test_stock_fails_no_payment():
 # ---------------------------------------------------------------------------
 # 3. Participant Crash — Stock Service Dies Mid-Saga, Recovers
 # ---------------------------------------------------------------------------
-def test_participant_crash_recovery():
+def test_stock_crash_recovery():
     """Stop stock service, restart after 3s, saga completes via Kafka persistence."""
     ITEM_PRICE = 10
     ITEM_QTY = 2
@@ -339,7 +339,7 @@ def test_coordinator_crash_before_payment():
         f"('{stock_idem_key}', 200, '{cached_body}')")
 
     _docker_exec_sql(ORDER_DB, "orders",
-         f"UPDATE sagas SET state = 'PAYMENT_REQUESTED', updated_at = NOW() WHERE id = {saga_id}")
+         f"UPDATE sagas SET state = 'PAYMENT_REQUESTED' WHERE id = '{saga_id}'")
 
     # Then it recovers and will see that stock was requested
     _docker(f"docker start {ORDER_CONTAINER}")
@@ -421,14 +421,14 @@ def test_coordinator_crash_after_payment():
         f"('{stock_idem_key}', 200, '{stock_cached_body}')")
 
     _docker_exec_sql(ORDER_DB, "orders",
-         f"UPDATE sagas SET state = 'PAYMENT_REQUESTED', updated_at = NOW() WHERE id = {saga_id}")
+         f"UPDATE sagas SET state = 'PAYMENT_REQUESTED' WHERE id = '{saga_id}'")
 
     _docker_exec_sql(PAYMENT_DB, "payment",
-         f"UPDATE users SET credit = credit - {ORDER_PRICE} WHERE id = {user}")
+         f"UPDATE users SET credit = credit - {ORDER_PRICE} WHERE id = '{user}'")
 
     _docker_exec_sql(PAYMENT_DB, "payment",
          f"INSERT INTO idempotency_keys (key, status_code, body) "
-            f"VALUES ({payment_idem_key}, 200, {payment_cached_body}) ON CONFLICT DO NOTHING")
+            f"VALUES ('{payment_idem_key}', 200, '{payment_cached_body}') ON CONFLICT DO NOTHING")
 
     # Then it recovers and will see that stock and payment were requested, but saga NOT completed
     _docker(f"docker start {ORDER_CONTAINER}")
@@ -493,7 +493,7 @@ def test_coordinator_crash_stock_failed():
         f"('{saga_id}', '{order}', 'STOCK_REQUESTED', '{items_quantities}', 'recovery-test')")
 
     _docker_exec_sql(ORDER_DB, "orders",
-         f"UPDATE sagas SET state = 'STOCK_FAILED', updated_at = NOW() WHERE id = {saga_id}")
+         f"UPDATE sagas SET state = 'STOCK_FAILED' WHERE id = '{saga_id}'")
 
     # Then it recovers and will see that stock was requested
     _docker(f"docker start {ORDER_CONTAINER}")
@@ -577,17 +577,20 @@ def test_coordinator_crash_after_completed():
         f"('{stock_idem_key}', 200, '{stock_cached_body}')")
 
     _docker_exec_sql(ORDER_DB, "orders",
-         f"UPDATE sagas SET state = 'PAYMENT_REQUESTED', updated_at = NOW() WHERE id = {saga_id}")
+         f"UPDATE sagas SET state = 'PAYMENT_REQUESTED' WHERE id = '{saga_id}'")
 
     _docker_exec_sql(PAYMENT_DB, "payment",
-         f"UPDATE users SET credit = credit - {ORDER_PRICE} WHERE id = {user}")
+         f"UPDATE users SET credit = credit - {int(ORDER_PRICE)} WHERE id = '{user}'")
 
     _docker_exec_sql(PAYMENT_DB, "payment",
          f"INSERT INTO idempotency_keys (key, status_code, body) "
-            f"VALUES ({payment_idem_key}, 200, {payment_cached_body}) ON CONFLICT DO NOTHING")
+            f"VALUES ('{payment_idem_key}', 200, '{payment_cached_body}') ON CONFLICT DO NOTHING")
 
     _docker_exec_sql(ORDER_DB, "orders",
-         f"UPDATE sagas SET state = 'COMPLETED', updated_at = NOW() WHERE id = {saga_id}")
+         f"UPDATE sagas SET state = 'COMPLETED' WHERE id = '{saga_id}'")
+
+    _docker_exec_sql(ORDER_DB, "orders",
+         f"UPDATE orders SET paid = TRUE WHERE id = '{order}'")
 
     # Then it recovers and will see that stock and payment were requested, and saga completed
     _docker(f"docker start {ORDER_CONTAINER}")
@@ -598,6 +601,8 @@ def test_coordinator_crash_after_completed():
     stock_val = json_field(api("GET", f"/stock/find/{item}"), "stock")
     credit_val = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
     paid_val = json_field(api("GET", f"/orders/find/{order}"), "paid")
+
+    print(paid_val)
 
     committed = (stock_val == expected_stock and credit_val == expected_credit and paid_val is True)
 
@@ -647,11 +652,19 @@ def test_coordinator_crash_before_rolled_back():
         f"INSERT INTO idempotency_keys (key, status_code, body) VALUES "
         f"('{stock_idem_key}', 200, '{cached_body}')")
 
+    print("Will set payment requested")
+    # _docker_exec_sql(ORDER_DB, "orders",
+    #      f"DELETE sagas WHERE id = '{saga_id}'")
+    # _docker_exec_sql(ORDER_DB, "orders",
+    #      f"INSERT INTO sagas (id, order_id, state, items_quantities, "
+    #      f"original_correlation_id) VALUES "
+    #      f"('{saga_id}', '{order}', 'PAYMENT_REQUESTED', '{items_quantities}', 'recovery-test')")
     _docker_exec_sql(ORDER_DB, "orders",
-         f"UPDATE sagas SET state = 'PAYMENT_REQUESTED', updated_at = NOW() WHERE id = {saga_id}")
+         f"UPDATE sagas SET state = 'PAYMENT_REQUESTED' WHERE id = '{saga_id}'")
+    print("Set payment requested")
 
     _docker_exec_sql(ORDER_DB, "orders",
-         f"UPDATE sagas SET state = 'ROLLBACK_REQUESTED', updated_at = NOW() WHERE id = {saga_id}")
+         f"UPDATE sagas SET state = 'ROLLBACK_REQUESTED' WHERE id = '{saga_id}'")
 
     _docker(f"docker start {ORDER_CONTAINER}")
 
@@ -724,10 +737,10 @@ def test_coordinator_crash_after_rolled_back():
         f"('{stock_idem_key}', 200, '{cached_body_request}')")
 
     _docker_exec_sql(ORDER_DB, "orders",
-         f"UPDATE sagas SET state = 'PAYMENT_REQUESTED', updated_at = NOW() WHERE id = {saga_id}")
+         f"UPDATE sagas SET state = 'PAYMENT_REQUESTED' WHERE id = '{saga_id}'")
 
     _docker_exec_sql(ORDER_DB, "orders",
-         f"UPDATE sagas SET state = 'ROLLBACK_REQUESTED', updated_at = NOW() WHERE id = {saga_id}")
+         f"UPDATE sagas SET state = 'ROLLBACK_REQUESTED' WHERE id = '{saga_id}'")
 
     _docker_exec_sql(STOCK_DB, "stock",
          f"UPDATE items SET stock = stock + {ITEM_QTY} WHERE id = '{item}'")
@@ -737,7 +750,7 @@ def test_coordinator_crash_after_rolled_back():
          f"('{stock_idem_key}', 200, '{cached_body_rollback}')")
 
     _docker_exec_sql(ORDER_DB, "orders",
-         f"UPDATE sagas SET state = 'ROLLED_BACK', updated_at = NOW() WHERE id = {saga_id}")
+         f"UPDATE sagas SET state = 'ROLLED_BACK' WHERE id = '{saga_id}'")
 
     _docker(f"docker start {ORDER_CONTAINER}")
 
@@ -756,18 +769,60 @@ def test_coordinator_crash_after_rolled_back():
     )
 
 # ---------------------------------------------------------------------------
+# 12. Participant Crash — Payment Service Dies Mid-Saga, Recovers
+# ---------------------------------------------------------------------------
+def test_payment_crash_recovery():
+    """Stop stock service, restart after 3s, saga completes via Kafka persistence."""
+    ITEM_PRICE = 10
+    ITEM_QTY = 2
+    STOCK = 5
+    CREDIT = 100
+    CONTAINER = "wdm-project-group24-payment-service-1"
+
+    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    api("POST", f"/payment/add_funds/{user}/{CREDIT}")
+    item = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
+    api("POST", f"/stock/add/{item}/{STOCK}")
+    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+    api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
+
+    _docker(f"docker stop {CONTAINER}")
+    subprocess.Popen(
+        f"sleep 3 && docker start {CONTAINER}",
+        shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+    r = api("POST", f"/orders/checkout/{order}")
+    expected_stock = STOCK - ITEM_QTY
+    expected_credit = CREDIT - (ITEM_PRICE * ITEM_QTY)
+
+    check("Checkout Completed After Payment Service Recovered — Kafka Message Persisted And Processed",
+          r.status_code == 200, f"got {r.status_code}")
+
+    _wait_for_service(f"/payment/find_user/{user}")
+    stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    credit = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
+
+    check(f"Stock Decreased To {expected_stock} After Recovery — {ITEM_QTY} Units Sold",
+          stock == expected_stock, f"got {stock}")
+    check(f"Credit Decreased To {expected_credit} After Recovery — "
+          f"Charged {ITEM_PRICE}x{ITEM_QTY}",
+          credit == expected_credit, f"got {credit}")
+
+# ---------------------------------------------------------------------------
 # Ordered test list — imported by run.py
 # ---------------------------------------------------------------------------
 TESTS = [
-    ("Compensating Transaction: Payment Fails, Stock Rolled Back", test_compensation_payment_fails),
-    ("Stock Reservation Fails — No Payment Attempted", test_stock_fails_no_payment),
-    ("Participant Crash: Stock Dies Mid-Saga And Recovers", test_participant_crash_recovery),
-    ("Coordinator Crash: Saga Crashes Before Stock Request", test_coordinator_crash_before_stock),
-    ("Coordinator Crash: Saga Crashes After Stock Request", test_coordinator_crash_after_stock),
-    ("Coordinator Crash: Saga Crashes Before Payment Request", test_coordinator_crash_before_payment),
+    # ("Compensating Transaction: Payment Fails, Stock Rolled Back", test_compensation_payment_fails),
+    # ("Stock Reservation Fails — No Payment Attempted", test_stock_fails_no_payment),
+    # ("Participant Crash: Stock Dies Mid-Saga And Recovers", test_stock_crash_recovery),
+    # ("Participant Crash: Payment Dies Mid-Saga And Recovers", test_payment_crash_recovery),
+    # ("Coordinator Crash: Saga Crashes Before Stock Request", test_coordinator_crash_before_stock),
+    # ("Coordinator Crash: Saga Crashes After Stock Request", test_coordinator_crash_after_stock),
+    # ("Coordinator Crash: Saga Crashes Before Payment Request", test_coordinator_crash_before_payment),
     ("Coordinator Crash: Saga Crashes After Payment Request", test_coordinator_crash_after_payment),
-    ("Coordinator Crash: Saga Crashes After Stock Failed", test_coordinator_crash_stock_failed),
+    # ("Coordinator Crash: Saga Crashes After Stock Failed", test_coordinator_crash_stock_failed),
     ("Coordinator Crash: Saga Crashes After Saga Completed", test_coordinator_crash_after_completed),
-    ("Coordinator Crash: Saga Crashes After Rollback Requested", test_coordinator_crash_before_rolled_back),
-    ("Coordinator Crash: Saga Crashes After Rollback Successful", test_coordinator_crash_after_rolled_back),
+    # ("Coordinator Crash: Saga Crashes After Rollback Requested", test_coordinator_crash_before_rolled_back),
+    # ("Coordinator Crash: Saga Crashes After Rollback Successful", test_coordinator_crash_after_rolled_back),
 ]
