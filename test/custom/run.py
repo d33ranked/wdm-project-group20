@@ -40,6 +40,39 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 # ---------------------------------------------------------------------------
 # Shared test harness — imported by test_common, test_tpc, test_sagas
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Docker helpers (shared by test_tpc and test_sagas)
+# ---------------------------------------------------------------------------
+
+def docker_cmd(cmd: str):
+    """Run a docker command silently."""
+    subprocess.run(
+        cmd, shell=True, cwd=PROJECT_ROOT,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def docker_exec_sql(container: str, db: str, sql: str):
+    """Execute a SQL statement inside a postgres container."""
+    subprocess.run(
+        ["docker", "exec", container, "psql", "-U", "user", "-d", db, "-c", sql],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def wait_for_service(probe_path: str, timeout: int = 60):
+    """Poll until a service endpoint responds with a non-5xx status."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            r = requests.get(f"{BASE_URL}{probe_path}", timeout=3)
+            if r.status_code < 500:
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
 _pass_count = 0
 _fail_count = 0
 
@@ -103,14 +136,26 @@ def _run(cmd: str, cwd: str = PROJECT_ROOT, check_rc: bool = True):
 
 
 def set_transaction_mode(mode: str):
-    """Patch TRANSACTION_MODE in docker-compose.yml."""
+    """Patch TRANSACTION_MODE and nginx config in docker-compose.yml."""
     with open(COMPOSE_FILE, "r") as f:
         content = f.read()
+    # Update TRANSACTION_MODE env var across all services
     updated = re.sub(
         r"(TRANSACTION_MODE=)\w+",
         rf"\g<1>{mode}",
         content,
     )
+    # Swap nginx config file mount: TPC uses gateway_nginx.conf, SAGA uses gateway_nginx_saga.conf
+    if mode == "SAGA":
+        updated = updated.replace(
+            "./gateway_nginx.conf:/etc/nginx/nginx.conf:ro",
+            "./gateway_nginx_saga.conf:/etc/nginx/nginx.conf:ro",
+        )
+    else:
+        updated = updated.replace(
+            "./gateway_nginx_saga.conf:/etc/nginx/nginx.conf:ro",
+            "./gateway_nginx.conf:/etc/nginx/nginx.conf:ro",
+        )
     with open(COMPOSE_FILE, "w") as f:
         f.write(updated)
     print(f"  Docker Compose Updated! Transaction Mode: {mode}")
@@ -134,18 +179,19 @@ def wait_for_services(timeout: int = 90):
     endpoints = [
         "/stock/item/create/1",
         "/payment/create_user",
+        "/orders/create/healthcheck",
     ]
     start = time.time()
     while time.time() - start < timeout:
         try:
             ok = all(
-                requests.post(f"{BASE_URL}{ep}", timeout=5).status_code == 200
+                requests.post(f"{BASE_URL}{ep}", timeout=5).status_code < 300
                 for ep in endpoints
             )
             if ok:
                 print("  All Services Are Up.\n")
                 return
-        except requests.ConnectionError:
+        except requests.RequestException:
             pass
         time.sleep(3)
     print("  Timed Out Waiting for Services.")
@@ -174,6 +220,7 @@ def collect_tests(module_name: str):
 
 def run_suite(label: str, tests: list):
     """Run a list of (name, func) test pairs; user presses Enter between them."""
+    global _fail_count
     if not tests:
         sep = "=" * LINE_WIDTH
         print(f"\n{sep}")
@@ -201,7 +248,6 @@ def run_suite(label: str, tests: list):
             func()
         except Exception as e:
             print(f"    \033[91m[ERROR]\033[0m {e}")
-            global _fail_count
             _fail_count += 1
 
         _, f = get_counts()
@@ -217,7 +263,7 @@ def main():
     sep = "=" * LINE_WIDTH
     print()
     print(sep)
-    print("  Group 20 Test Suite")
+    print("  BENCHMARKING SUITE — GROUP 20")
     print(sep)
 
     # --- Ask for mode ---
