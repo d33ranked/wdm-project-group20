@@ -170,6 +170,7 @@ def route_gateway_message(payload, conn):
     headers = payload.get("headers") or {}
     headers["X-Correlation-Id"] = payload.get("correlation_id", "")
     segments = [s for s in path.strip("/").split("/") if s]
+    idem_key = headers.get("Idempotency-Key") or headers.get("idempotency-key")
 
     # POST /create/<user_id>
     if method == "POST" and len(segments) >= 2 and segments[0] == "create":
@@ -210,6 +211,9 @@ def route_gateway_message(payload, conn):
     # POST /addItem/<order_id>/<item_id>/<quantity>
     if method == "POST" and len(segments) >= 4 and segments[0] == "addItem":
         order_id, item_id, quantity = segments[1], segments[2], int(segments[3])
+        cached = check_idempotency_kafka(conn, idem_key)
+        if cached:
+            return cached
         stock_response = _fetch_item_price(item_id)
         if stock_response is None:
             return 503, {"error": "Stock service timeout fetching item price"}
@@ -233,8 +237,10 @@ def route_gateway_message(payload, conn):
             total_cost += quantity * item_price
             cur.execute("UPDATE orders SET items = %s, total_cost = %s WHERE id = %s",
                         (json.dumps(items_list), total_cost, order_id))
+        body = f"Item: {item_id} added to: {order_id} price updated to: {total_cost}"
+        save_idempotency_kafka(conn, idem_key, 200, body)
         conn.commit()
-        return 200, f"Item: {item_id} added to: {order_id} price updated to: {total_cost}"
+        return 200, body
 
     # POST /checkout/<order_id>
     if method == "POST" and len(segments) >= 2 and segments[0] == "checkout":

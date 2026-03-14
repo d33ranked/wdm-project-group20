@@ -479,6 +479,44 @@ def test_find_nonexistent():
 
 
 # ---------------------------------------------------------------------------
+# 15. addItem Idempotency — Same Key Sent Twice, Quantity Added Once
+# ---------------------------------------------------------------------------
+def test_add_item_idempotency():
+    """Sending the same addItem request twice with the same idempotency key
+    must add the item only once — no quantity doubling, no cost doubling."""
+    PRICE = 10
+    STOCK = 5
+
+    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    item = json_field(api("POST", f"/stock/item/create/{PRICE}"), "item_id")
+    api("POST", f"/stock/add/{item}/{STOCK}")
+    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+
+    headers = {"Idempotency-Key": "add-item-idem-test-001"}
+
+    r1 = api("POST", f"/orders/addItem/{order}/{item}/2", headers=headers)
+    check("First addItem With Idempotency Key Succeeds",
+          r1.status_code == 200, f"got {r1.status_code}")
+
+    r2 = api("POST", f"/orders/addItem/{order}/{item}/2", headers=headers)
+    check("Second addItem With Same Idempotency Key Returns 200 — Cached, Not Re-Applied",
+          r2.status_code == 200, f"got {r2.status_code}")
+
+    check("Both Responses Are Identical — Confirms Second Was Served From Cache",
+          r1.text == r2.text, f"r1={r1.text!r} r2={r2.text!r}")
+
+    order_data = api("GET", f"/orders/find/{order}").json()
+    items = order_data.get("items", [])
+    total_cost = order_data.get("total_cost", 0)
+
+    quantity_in_order = sum(q for (iid, q) in items if iid == item)
+    check("Order Contains Item With Quantity 2 — Not 4 (Not Added Twice)",
+          quantity_in_order == 2, f"got quantity={quantity_in_order}")
+    check(f"Total Cost Is {PRICE * 2} — Reflects One addItem Call, Not Two",
+          total_cost == PRICE * 2, f"got total_cost={total_cost}")
+
+
+# ---------------------------------------------------------------------------
 # Ordered test list — imported by run.py
 # ---------------------------------------------------------------------------
 TESTS = [
@@ -496,4 +534,5 @@ TESTS = [
     ("Boundary: One Credit Short Of Order Total", test_one_credit_short),
     ("Boundary: One Stock Unit Short Of Order Quantity", test_one_stock_short),
     ("GET On Non-Existent Stock, User, And Order IDs", test_find_nonexistent),
+    ("addItem Idempotency — Same Key Prevents Duplicate Quantity", test_add_item_idempotency),
 ]

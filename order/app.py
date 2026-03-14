@@ -12,6 +12,7 @@ import threading
 from flask import Flask, jsonify, abort, request, Response, g
 
 from common.db import create_conn_pool, setup_flask_lifecycle, setup_gunicorn_logging
+from common.idempotency import check_idempotency_http, save_idempotency_http
 
 import tpc
 import saga
@@ -87,6 +88,11 @@ def find_order(order_id: str):
 @app.post("/addItem/<order_id>/<item_id>/<quantity>")
 def add_item(order_id: str, item_id: str, quantity: int):
     quantity = int(quantity)
+    idem_key = request.headers.get("Idempotency-Key")
+    cached = check_idempotency_http(g.conn, idem_key)
+    if cached is not None:
+        return Response(cached[1], status=cached[0])
+
     stock_reply = tpc.send_get_request(f"{STOCK_SERVICE_URL}/find/{item_id}")
     if stock_reply.status_code != 200:
         abort(400, f"Item: {item_id} does not exist!")
@@ -109,7 +115,9 @@ def add_item(order_id: str, item_id: str, quantity: int):
         total_cost += quantity * item_price
         cur.execute("UPDATE orders SET items = %s, total_cost = %s WHERE id = %s",
                     (json.dumps(items_list), total_cost, order_id))
-    return Response(f"Item: {item_id} added to: {order_id} price updated to: {total_cost}", status=200)
+    body = f"Item: {item_id} added to: {order_id} price updated to: {total_cost}"
+    save_idempotency_http(g.conn, idem_key, 200, body)
+    return Response(body, status=200)
 
 
 @app.post("/checkout/<order_id>")
