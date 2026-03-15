@@ -6,8 +6,8 @@ COPY order/requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY common/ ./common/
-COPY order/app.py order/db.py order/tpc.py order/saga.py ./
+COPY order/order_app.py order/db.py order/tpc.py order/saga.py ./
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["gunicorn", "-k", "gevent", "-b", "0.0.0.0:5000", "-w", "1", "--timeout", "30", "--log-level=info", "app:app"]
+CMD ["python", "order_app.py"]

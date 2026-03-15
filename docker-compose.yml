@@ -7,31 +7,24 @@ services:
     restart: on-failure
     ports:
       - "8001:8000"
-    env_file:
-      - env/kafka.env
     environment:
       - REQUEST_TIMEOUT_MS=30000
       - KAFKA_BOOTSTRAP_SERVERS=kafka-external:9092
+    env_file:
+      - env/kafka.env
     depends_on:
       kafka-external:
         condition: service_healthy
-      order-service:
-        condition: service_started
-      stock-service:
-        condition: service_started
-      payment-service:
-        condition: service_started
 
+  # nginx sits in front and proxies everything to the api-gateway
   nginx:
     image: nginx:1.25-bookworm
     volumes:
-      - ./gateway_nginx_saga.conf:/etc/nginx/nginx.conf:ro
+      - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
       - "8000:80"
     depends_on:
-      - order-service
-      - stock-service
-      - payment-service
+      - api-gateway
 
   order-service:
     build:
@@ -40,12 +33,9 @@ services:
     image: order:latest
     restart: on-failure
     environment:
-      - TRANSACTION_MODE=SAGA
-      - GATEWAY_URL=http://nginx:80
-      - STOCK_SERVICE_URL=http://stock-service:5000
+      - CHECKOUT_MODE=SAGA
       - KAFKA_BOOTSTRAP_SERVERS=kafka-external:9092
       - INTERNAL_KAFKA_BOOTSTRAP_SERVERS=kafka-internal:9092
-    command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_db.env
     depends_on:
@@ -78,10 +68,8 @@ services:
     image: stock:latest
     restart: on-failure
     environment:
-      - TRANSACTION_MODE=SAGA
       - KAFKA_BOOTSTRAP_SERVERS=kafka-external:9092
       - INTERNAL_KAFKA_BOOTSTRAP_SERVERS=kafka-internal:9092
-    command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_db.env
     depends_on:
@@ -114,10 +102,8 @@ services:
     image: payment:latest
     restart: on-failure
     environment:
-      - TRANSACTION_MODE=SAGA
       - KAFKA_BOOTSTRAP_SERVERS=kafka-external:9092
       - INTERNAL_KAFKA_BOOTSTRAP_SERVERS=kafka-internal:9092
-    command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_db.env
     depends_on:

@@ -6,8 +6,8 @@ COPY stock/requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY common/ ./common/
-COPY stock/app.py stock/tpc.py stock/saga.py ./
+COPY stock/stock_app.py stock/tpc.py stock/saga.py ./
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "app.py"]
+CMD ["python", "stock_app.py"]
