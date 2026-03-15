@@ -6,7 +6,7 @@ COPY payment/requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY common/ ./common/
-COPY payment/payment_app.py payment/tpc.py payment/saga.py ./
+COPY payment/payment_app.py payment/kafka_handler.py payment/recovery.py ./
 
 ENV PYTHONUNBUFFERED=1
 

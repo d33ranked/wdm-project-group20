@@ -6,7 +6,7 @@ COPY order/requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY common/ ./common/
-COPY order/order_app.py order/db.py order/tpc.py order/saga.py ./
+COPY order/order_app.py order/db.py order/tpc.py order/saga.py order/recovery.py order/kafka_handler.py ./
 
 ENV PYTHONUNBUFFERED=1
 
