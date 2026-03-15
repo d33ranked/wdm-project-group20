@@ -1,18 +1,34 @@
-import os
+"""
+Database helpers — connection pool creation.
+
+Services are pure Kafka consumers with no HTTP server, so there is no Flask
+lifecycle to hook into.  Each Kafka worker thread borrows a connection from
+the pool for the duration of one message, then returns it.
+"""
+
 import atexit
 import logging
+import os
 
 import psycopg2
 import psycopg2.pool
-from time import perf_counter
-from flask import g
 
 logger = logging.getLogger(__name__)
 
 
-def create_conn_pool(service_name):
+def create_conn_pool(service_name: str) -> psycopg2.pool.ThreadedConnectionPool:
+    """
+    Create a threaded connection pool for the given service.
+
+    Reads connection parameters from environment variables:
+      POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+
+    The pool is registered with atexit so all connections are cleanly closed
+    when the process exits.
+    """
     pool = psycopg2.pool.ThreadedConnectionPool(
-        minconn=10, maxconn=100,
+        minconn=10,
+        maxconn=100,
         host=os.environ["POSTGRES_HOST"],
         port=int(os.environ["POSTGRES_PORT"]),
         dbname=os.environ["POSTGRES_DB"],
@@ -20,30 +36,5 @@ def create_conn_pool(service_name):
         password=os.environ["POSTGRES_PASSWORD"],
     )
     atexit.register(pool.closeall)
+    logger.info("%s: DB connection pool created", service_name)
     return pool
-
-
-def setup_flask_lifecycle(app, conn_pool, service_name):
-    @app.before_request
-    def _before():
-        g.start_time = perf_counter()
-        g.conn = conn_pool.getconn()
-
-    @app.after_request
-    def _after(response):
-        duration = perf_counter() - g.start_time
-        logger.debug("%s: Request took %.7f seconds", service_name, duration)
-        return response
-
-    @app.teardown_request
-    def _teardown(exception):
-        conn = g.pop("conn", None)
-        if conn is not None:
-            conn.rollback() if exception else conn.commit()
-            conn_pool.putconn(conn)
-
-
-def setup_gunicorn_logging(app):
-    gunicorn_logger = logging.getLogger("gunicorn.error")
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)

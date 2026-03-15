@@ -16,3 +16,10 @@ CREATE TABLE IF NOT EXISTS prepared_transactions (
     amount INTEGER NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS compensating_transactions (
+    txn_id     TEXT      PRIMARY KEY,
+    user_id    TEXT      NOT NULL,
+    amount     INTEGER   NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);

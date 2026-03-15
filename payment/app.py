@@ -1,150 +1,100 @@
-import gevent.monkey
-gevent.monkey.patch_all()
+"""
+Payment service — pure Kafka consumer process.
 
-import os
-import uuid
+No HTTP server.  All requests arrive via Kafka, all responses are published
+back to Kafka.  The api-gateway is the sole HTTP entry point for the system.
+
+Three consumer loops run as threads:
+
+  gateway-consumer      — HTTP-proxy requests from the api-gateway
+                          (create_user, batch_init, find_user, add_funds, pay)
+  tpc-consumer          — 2PC commands from the order service
+                          (payment.prepare / payment.commit / payment.rollback)
+  saga-consumer         — SAGA commands from the order service
+                          (payment.execute / payment.rollback)
+
+A background recovery thread periodically rolls back stale prepared
+transactions (2PC only) to ensure eventual consistency after coordinator
+crashes.  SAGA transactions have no stale state — silence means success.
+"""
+
 import logging
+import os
 import threading
 
-from flask import Flask, jsonify, abort, request, Response, g
-
-from common.db import create_conn_pool, setup_flask_lifecycle, setup_gunicorn_logging
-from common.idempotency import check_idempotency_http, save_idempotency_http
+from common.db import create_conn_pool
 from common.kafka_helpers import build_producer, run_consumer_loop
+import kafka_handler
+import recovery
 
-TRANSACTION_MODE = os.environ.get("TRANSACTION_MODE", "TPC")
-GATEWAY_KAFKA = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka-external:9092")
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+GATEWAY_KAFKA  = os.environ.get("KAFKA_BOOTSTRAP_SERVERS",          "kafka-external:9092")
 INTERNAL_KAFKA = os.environ.get("INTERNAL_KAFKA_BOOTSTRAP_SERVERS", "kafka-internal:9092")
-
-app = Flask("payment-service")
-logger = logging.getLogger(__name__)
-
-conn_pool = create_conn_pool("PAYMENT")
-setup_flask_lifecycle(app, conn_pool, "PAYMENT")
-
-# ---------------------------------------------------------------------------
-# Flask Endpoints (Both Modes)
-# ---------------------------------------------------------------------------
-
-@app.post("/create_user")
-def create_user():
-    key = str(uuid.uuid4())
-    with g.conn.cursor() as cur:
-        cur.execute("INSERT INTO users (id, credit) VALUES (%s, %s)", (key, 0))
-    return jsonify({"user_id": key})
-
-
-@app.post("/batch_init/<n>/<starting_money>")
-def batch_init_users(n: int, starting_money: int):
-    n, starting_money = int(n), int(starting_money)
-    with g.conn.cursor() as cur:
-        for i in range(n):
-            cur.execute(
-                "INSERT INTO users (id, credit) VALUES (%s, %s) "
-                "ON CONFLICT (id) DO UPDATE SET credit = EXCLUDED.credit",
-                (str(i), starting_money),
-            )
-    return jsonify({"msg": "Batch init for users successful"})
-
-
-@app.get("/find_user/<user_id>")
-def find_user(user_id: str):
-    with g.conn.cursor() as cur:
-        cur.execute("SELECT credit FROM users WHERE id = %s", (user_id,))
-        row = cur.fetchone()
-    if row is None:
-        abort(400, f"User: {user_id} not found!")
-    return jsonify({"user_id": user_id, "credit": row[0]})
-
-
-@app.post("/add_funds/<user_id>/<amount>")
-def add_credit(user_id: str, amount: int):
-    if int(amount) <= 0:
-        abort(400, "Amount must be positive!")
-    idem_key = request.headers.get("Idempotency-Key")
-    cached = check_idempotency_http(g.conn, idem_key)
-    if cached is not None:
-        return Response(cached[1], status=cached[0])
-
-    with g.conn.cursor() as cur:
-        cur.execute("SELECT credit FROM users WHERE id = %s FOR UPDATE", (user_id,))
-        row = cur.fetchone()
-        if row is None:
-            abort(400, f"User: {user_id} not found!")
-        cur.execute("UPDATE users SET credit = credit + %s WHERE id = %s RETURNING credit", (int(amount), user_id))
-        new_credit = cur.fetchone()[0]
-
-    body = f"User: {user_id} credit updated to: {new_credit}"
-    save_idempotency_http(g.conn, idem_key, 200, body)
-    return Response(body, status=200)
-
-
-@app.post("/pay/<user_id>/<amount>")
-def remove_credit(user_id: str, amount: int):
-    if int(amount) <= 0:
-        abort(400, "Amount must be positive!")
-    idem_key = request.headers.get("Idempotency-Key")
-    cached = check_idempotency_http(g.conn, idem_key)
-    if cached is not None:
-        return Response(cached[1], status=cached[0])
-
-    with g.conn.cursor() as cur:
-        cur.execute("SELECT credit FROM users WHERE id = %s FOR UPDATE", (user_id,))
-        row = cur.fetchone()
-        if row is None:
-            abort(400, f"User: {user_id} not found!")
-        if row[0] - int(amount) < 0:
-            abort(400, f"User: {user_id} credit cannot get reduced below zero!")
-        cur.execute("UPDATE users SET credit = credit - %s WHERE id = %s RETURNING credit", (int(amount), user_id))
-        new_credit = cur.fetchone()[0]
-
-    body = f"User: {user_id} credit updated to: {new_credit}"
-    save_idempotency_http(g.conn, idem_key, 200, body)
-    return Response(body, status=200)
-
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "healthy"})
 
 # ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
 
-import tpc
-import saga
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-with app.app_context():
-    if TRANSACTION_MODE == "TPC":
-        tpc.init_routes(app)
-        try:
-            tpc.recovery(conn_pool)
-        except Exception as e:
-            print(f"RECOVERY PAYMENT: {e}", flush=True)
 
-    elif TRANSACTION_MODE == "SAGA":
-        gateway_producer = build_producer(GATEWAY_KAFKA)
-        internal_producer = build_producer(INTERNAL_KAFKA)
+def _start_consumer(conn_pool, bootstrap, topic, group_id, producer, response_topic, handler, name):
+    """Convenience wrapper — starts a run_consumer_loop daemon thread."""
+    threading.Thread(
+        target=run_consumer_loop,
+        args=(conn_pool, bootstrap, topic, group_id, producer, response_topic, handler, name),
+        daemon=True,
+        name=name,
+    ).start()
 
-        threading.Thread(
-            target=run_consumer_loop,
-            args=(conn_pool, INTERNAL_KAFKA, "internal.payment",
-                  "payment-service-internal", internal_producer,
-                  "internal.responses", saga.route_kafka_message, "Payment"),
-            daemon=True, name="internal-consumer",
-        ).start()
 
-        threading.Thread(
-            target=run_consumer_loop,
-            args=(conn_pool, GATEWAY_KAFKA, "gateway.payment",
-                  "payment-service-gateway", gateway_producer,
-                  "gateway.responses", saga.route_kafka_message, "Payment"),
-            daemon=True, name="gateway-consumer",
-        ).start()
+def main():
+    conn_pool = create_conn_pool("PAYMENT")
 
-        print("SAGA mode: Kafka consumers started", flush=True)
+    gateway_producer  = build_producer(GATEWAY_KAFKA)
+    internal_producer = build_producer(INTERNAL_KAFKA)
+
+    # Gateway — HTTP-proxy requests from the api-gateway
+    _start_consumer(
+        conn_pool, GATEWAY_KAFKA,
+        "gateway.payment", "payment-service-gateway",
+        gateway_producer, "gateway.responses",
+        kafka_handler.handle_gateway_message, "Payment-Gateway",
+    )
+
+    # 2PC — pessimistic coordination (prepare / commit / rollback)
+    _start_consumer(
+        conn_pool, INTERNAL_KAFKA,
+        "internal.payment.tpc", "payment-service-tpc",
+        internal_producer, "internal.responses",
+        kafka_handler.handle_tpc_message, "Payment-TPC",
+    )
+
+    # SAGA — optimistic coordination (execute / rollback, silence = success)
+    _start_consumer(
+        conn_pool, INTERNAL_KAFKA,
+        "internal.payment.saga", "payment-service-saga",
+        internal_producer, "internal.responses",
+        kafka_handler.handle_saga_message, "Payment-SAGA",
+    )
+
+    # Recovery — periodically rolls back stale 2PC prepared transactions
+    threading.Thread(
+        target=recovery.run_recovery_loop,
+        args=(conn_pool, internal_producer),
+        daemon=True,
+        name="recovery",
+    ).start()
+
+    logger.info("Payment service started")
+
+    # Block main thread — daemon threads exit when this returns
+    threading.Event().wait()
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
-else:
-    setup_gunicorn_logging(app)
+    main()
