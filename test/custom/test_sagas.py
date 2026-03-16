@@ -14,40 +14,7 @@ import uuid
 
 import requests
 
-from run import api, check, json_field, PROJECT_ROOT, BASE_URL
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def _docker(cmd: str):
-    """Run a docker command silently."""
-    subprocess.run(
-        cmd, shell=True, cwd=PROJECT_ROOT,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-
-
-def _docker_exec_sql(container: str, db: str, sql: str):
-    """Execute a SQL statement inside a postgres container."""
-    subprocess.run(
-        ["docker", "exec", container, "psql", "-U", "user", "-d", db, "-c", sql],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-
-
-def _wait_for_service(probe_path: str, timeout: int = 60):
-    """Poll until a service endpoint responds with a non-5xx status."""
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            r = requests.get(f"{BASE_URL}{probe_path}", timeout=3)
-            if r.status_code < 500:
-                return True
-        except Exception:
-            pass
-        time.sleep(2)
-    return False
+from run import api, check, json_field, PROJECT_ROOT, BASE_URL, docker_cmd, docker_exec_sql, wait_for_service
 
 # ---------------------------------------------------------------------------
 # 1. Saved idempotency: checkout is successful, nothing changes
@@ -71,7 +38,7 @@ def test_idempotency_saved():
     api("POST", f"/orders/addItem/{order}/{item}/1")
 
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
          f"INSERT INTO idempotency_keys (key, status_code, body) VALUES ('{order_idemp_key}', 200, '{order_body}') ON CONFLICT DO NOTHING")
 
     # TODO fix this, not working
@@ -115,7 +82,7 @@ def test_order_already_paid():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/1")
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
          f"UPDATE orders SET paid = TRUE WHERE id = '{order}'")
 
     r = api("POST", f"/orders/checkout/{order}")
@@ -217,7 +184,7 @@ def test_stock_crash_recovery():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    _docker(f"docker stop {CONTAINER}")
+    docker_cmd(f"docker stop {CONTAINER}")
     subprocess.Popen(
         f"sleep 3 && docker start {CONTAINER}",
         shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -230,7 +197,7 @@ def test_stock_crash_recovery():
     check("Checkout Completed After Stock Service Recovered — Kafka Message Persisted And Processed",
           r.status_code == 200, f"got {r.status_code}")
 
-    _wait_for_service(f"/stock/find/{item}")
+    wait_for_service(f"/stock/find/{item}")
     stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
     credit = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
 
@@ -258,7 +225,7 @@ def test_payment_crash_recovery():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    _docker(f"docker stop {CONTAINER}")
+    docker_cmd(f"docker stop {CONTAINER}")
     subprocess.Popen(
         f"sleep 3 && docker start {CONTAINER}",
         shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -271,7 +238,7 @@ def test_payment_crash_recovery():
     check("Checkout Completed After Payment Service Recovered — Kafka Message Persisted And Processed",
           r.status_code == 200, f"got {r.status_code}")
 
-    _wait_for_service(f"/payment/find_user/{user}")
+    wait_for_service(f"/payment/find_user/{user}")
     stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
     credit = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
 
@@ -308,7 +275,7 @@ def test_coordinator_crash_after_stock():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    _docker(f"docker stop {ORDER_CONTAINER}")
+    docker_cmd(f"docker stop {ORDER_CONTAINER}")
 
     saga_id = str(uuid.uuid4())
     items_quantities = json.dumps({item: ITEM_QTY})
@@ -317,22 +284,22 @@ def test_coordinator_crash_after_stock():
     cached_body = json.dumps({"updated_stock": {item: new_stock}})
 
     # Process stock as if the order did it
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
         f"INSERT INTO sagas (id, order_id, state, items_quantities, "
         f"original_correlation_id) VALUES "
         f"('{saga_id}', '{order}', 'STOCK_REQUESTED', '{items_quantities}', 'recovery-test')")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
         f"UPDATE items SET stock = stock - {ITEM_QTY} WHERE id = '{item}'")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
         f"INSERT INTO idempotency_keys (key, status_code, body) VALUES "
         f"('{stock_idem_key}', 200, '{cached_body}')")
 
     # Then it recovers and will see that stock was requested
-    _docker(f"docker start {ORDER_CONTAINER}")
+    docker_cmd(f"docker start {ORDER_CONTAINER}")
 
-    _wait_for_service(f"/orders/find/{order}", timeout=90)
+    wait_for_service(f"/orders/find/{order}", timeout=90)
     time.sleep(15)
 
     stock_val = json_field(api("GET", f"/stock/find/{item}"), "stock")
@@ -378,7 +345,7 @@ def test_coordinator_crash_before_stock():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    _docker(f"docker stop {ORDER_CONTAINER}")
+    docker_cmd(f"docker stop {ORDER_CONTAINER}")
 
     saga_id = str(uuid.uuid4())
     items_quantities = json.dumps({item: ITEM_QTY})
@@ -387,15 +354,15 @@ def test_coordinator_crash_before_stock():
     cached_body = json.dumps({"updated_stock": {item: new_stock}})
 
     # Process stock as if the order did it
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
         f"INSERT INTO sagas (id, order_id, state, items_quantities, "
         f"original_correlation_id) VALUES "
         f"('{saga_id}', '{order}', 'STOCK_REQUESTED', '{items_quantities}', 'recovery-test')")
 
     # Then it recovers and will see that stock was requested
-    _docker(f"docker start {ORDER_CONTAINER}")
+    docker_cmd(f"docker start {ORDER_CONTAINER}")
 
-    _wait_for_service(f"/orders/find/{order}", timeout=90)
+    wait_for_service(f"/orders/find/{order}", timeout=90)
     time.sleep(15)
 
     stock_val = json_field(api("GET", f"/stock/find/{item}"), "stock")
@@ -441,7 +408,7 @@ def test_coordinator_crash_before_payment():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    _docker(f"docker stop {ORDER_CONTAINER}")
+    docker_cmd(f"docker stop {ORDER_CONTAINER}")
 
     saga_id = str(uuid.uuid4())
     items_quantities = json.dumps({item: ITEM_QTY})
@@ -449,24 +416,24 @@ def test_coordinator_crash_before_payment():
     new_stock = STOCK - ITEM_QTY
     cached_body = json.dumps({"updated_stock": {item: new_stock}})
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
         f"INSERT INTO sagas (id, order_id, state, items_quantities, "
         f"original_correlation_id) VALUES "
         f"('{saga_id}', '{order}', 'STOCK_REQUESTED', '{items_quantities}', 'recovery-test')")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
         f"UPDATE items SET stock = stock - {ITEM_QTY} WHERE id = '{item}'")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
         f"INSERT INTO idempotency_keys (key, status_code, body) VALUES "
         f"('{stock_idem_key}', 200, '{cached_body}')")
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
          f"UPDATE sagas SET state = 'PAYMENT_REQUESTED' WHERE id = '{saga_id}'")
 
-    _docker(f"docker start {ORDER_CONTAINER}")
+    docker_cmd(f"docker start {ORDER_CONTAINER}")
 
-    _wait_for_service(f"/orders/find/{order}", timeout=90)
+    wait_for_service(f"/orders/find/{order}", timeout=90)
     time.sleep(15)
 
     stock_val = json_field(api("GET", f"/stock/find/{item}"), "stock")
@@ -518,7 +485,7 @@ def test_coordinator_crash_after_payment():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    _docker(f"docker stop {ORDER_CONTAINER}")
+    docker_cmd(f"docker stop {ORDER_CONTAINER}")
 
     saga_id = str(uuid.uuid4())
     items_quantities = json.dumps({item: ITEM_QTY})
@@ -529,31 +496,31 @@ def test_coordinator_crash_after_payment():
     stock_cached_body = json.dumps({"updated_stock": {item: new_stock}})
     payment_cached_body = f"User: {user} credit updated to: {expected_credit}"
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
         f"INSERT INTO sagas (id, order_id, state, items_quantities, "
         f"original_correlation_id) VALUES "
         f"('{saga_id}', '{order}', 'STOCK_REQUESTED', '{items_quantities}', 'recovery-test')")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
         f"UPDATE items SET stock = stock - {ITEM_QTY} WHERE id = '{item}'")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
         f"INSERT INTO idempotency_keys (key, status_code, body) VALUES "
         f"('{stock_idem_key}', 200, '{stock_cached_body}')")
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
          f"UPDATE sagas SET state = 'PAYMENT_REQUESTED' WHERE id = '{saga_id}'")
 
-    _docker_exec_sql(PAYMENT_DB, "payments",
+    docker_exec_sql(PAYMENT_DB, "payments",
          f"UPDATE users SET credit = credit - {ORDER_PRICE} WHERE id = '{user}'")
 
-    _docker_exec_sql(PAYMENT_DB, "payments",
+    docker_exec_sql(PAYMENT_DB, "payments",
          f"INSERT INTO idempotency_keys (key, status_code, body) "
             f"VALUES ('{payment_idem_key}', 200, '{payment_cached_body}') ON CONFLICT DO NOTHING")
 
-    _docker(f"docker start {ORDER_CONTAINER}")
+    docker_cmd(f"docker start {ORDER_CONTAINER}")
 
-    _wait_for_service(f"/orders/find/{order}", timeout=90)
+    wait_for_service(f"/orders/find/{order}", timeout=90)
     time.sleep(15)
 
     stock_val = json_field(api("GET", f"/stock/find/{item}"), "stock")
@@ -597,24 +564,24 @@ def test_coordinator_crash_stock_failed():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    _docker(f"docker stop {ORDER_CONTAINER}")
+    docker_cmd(f"docker stop {ORDER_CONTAINER}")
 
     saga_id = str(uuid.uuid4())
     items_quantities = json.dumps({item: ITEM_QTY})
     stock_idem_key = f"{saga_id}:stock:subtract_batch"
     new_stock = STOCK - ITEM_QTY
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
         f"INSERT INTO sagas (id, order_id, state, items_quantities, "
         f"original_correlation_id) VALUES "
         f"('{saga_id}', '{order}', 'STOCK_REQUESTED', '{items_quantities}', 'recovery-test')")
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
          f"UPDATE sagas SET state = 'STOCK_FAILED' WHERE id = '{saga_id}'")
 
-    _docker(f"docker start {ORDER_CONTAINER}")
+    docker_cmd(f"docker start {ORDER_CONTAINER}")
 
-    _wait_for_service(f"/orders/find/{order}", timeout=90)
+    wait_for_service(f"/orders/find/{order}", timeout=90)
     time.sleep(15)
 
     stock_val = json_field(api("GET", f"/stock/find/{item}"), "stock")
@@ -668,7 +635,7 @@ def test_coordinator_crash_after_completed():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    _docker(f"docker stop {ORDER_CONTAINER}")
+    docker_cmd(f"docker stop {ORDER_CONTAINER}")
 
     saga_id = str(uuid.uuid4())
     items_quantities = json.dumps({item: ITEM_QTY})
@@ -679,37 +646,37 @@ def test_coordinator_crash_after_completed():
     stock_cached_body = json.dumps({"updated_stock": {item: new_stock}})
     payment_cached_body = f"User: {user} credit updated to: {expected_credit}"
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
         f"INSERT INTO sagas (id, order_id, state, items_quantities, "
         f"original_correlation_id) VALUES "
         f"('{saga_id}', '{order}', 'STOCK_REQUESTED', '{items_quantities}', 'recovery-test')")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
         f"UPDATE items SET stock = stock - {ITEM_QTY} WHERE id = '{item}'")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
         f"INSERT INTO idempotency_keys (key, status_code, body) VALUES "
         f"('{stock_idem_key}', 200, '{stock_cached_body}')")
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
          f"UPDATE sagas SET state = 'PAYMENT_REQUESTED' WHERE id = '{saga_id}'")
 
-    _docker_exec_sql(PAYMENT_DB, "payments",
+    docker_exec_sql(PAYMENT_DB, "payments",
          f"UPDATE users SET credit = credit - {int(ORDER_PRICE)} WHERE id = '{user}'")
 
-    _docker_exec_sql(PAYMENT_DB, "payments",
+    docker_exec_sql(PAYMENT_DB, "payments",
          f"INSERT INTO idempotency_keys (key, status_code, body) "
             f"VALUES ('{payment_idem_key}', 200, '{payment_cached_body}') ON CONFLICT DO NOTHING")
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
          f"UPDATE sagas SET state = 'COMPLETED' WHERE id = '{saga_id}'")
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
          f"UPDATE orders SET paid = TRUE WHERE id = '{order}'")
 
-    _docker(f"docker start {ORDER_CONTAINER}")
+    docker_cmd(f"docker start {ORDER_CONTAINER}")
 
-    _wait_for_service(f"/orders/find/{order}", timeout=90)
+    wait_for_service(f"/orders/find/{order}", timeout=90)
     time.sleep(15)
 
     stock_val = json_field(api("GET", f"/stock/find/{item}"), "stock")
@@ -745,7 +712,7 @@ def test_coordinator_crash_before_rolled_back():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    _docker(f"docker stop {ORDER_CONTAINER}")
+    docker_cmd(f"docker stop {ORDER_CONTAINER}")
 
     saga_id = str(uuid.uuid4())
     items_quantities = json.dumps({item: ITEM_QTY})
@@ -753,29 +720,29 @@ def test_coordinator_crash_before_rolled_back():
     new_stock = STOCK - ITEM_QTY
     cached_body = json.dumps({"updated_stock": {item: new_stock}})
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
         f"INSERT INTO sagas (id, order_id, state, items_quantities, "
         f"original_correlation_id) VALUES "
         f"('{saga_id}', '{order}', 'STOCK_REQUESTED', '{items_quantities}', 'recovery-test')")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
         f"UPDATE items SET stock = stock - {ITEM_QTY} WHERE id = '{item}'")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
         f"INSERT INTO idempotency_keys (key, status_code, body) VALUES "
         f"('{stock_idem_key}', 200, '{cached_body}')")
 
     print("Will set payment requested")
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
          f"UPDATE sagas SET state = 'PAYMENT_REQUESTED' WHERE id = '{saga_id}'")
     print("Set payment requested")
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
          f"UPDATE sagas SET state = 'ROLLBACK_REQUESTED' WHERE id = '{saga_id}'")
 
-    _docker(f"docker start {ORDER_CONTAINER}")
+    docker_cmd(f"docker start {ORDER_CONTAINER}")
 
-    _wait_for_service(f"/orders/find/{order}", timeout=90)
+    wait_for_service(f"/orders/find/{order}", timeout=90)
     time.sleep(15)
 
     stock_val = json_field(api("GET", f"/stock/find/{item}"), "stock")
@@ -821,7 +788,7 @@ def test_coordinator_crash_after_rolled_back():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    _docker(f"docker stop {ORDER_CONTAINER}")
+    docker_cmd(f"docker stop {ORDER_CONTAINER}")
 
     saga_id = str(uuid.uuid4())
     items_quantities = json.dumps({item: ITEM_QTY})
@@ -830,37 +797,37 @@ def test_coordinator_crash_after_rolled_back():
     cached_body_request = json.dumps({"updated_stock": {item: new_stock}})
     cached_body_rollback = json.dumps({"updated_stock": {item: STOCK}})
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
         f"INSERT INTO sagas (id, order_id, state, items_quantities, "
         f"original_correlation_id) VALUES "
         f"('{saga_id}', '{order}', 'STOCK_REQUESTED', '{items_quantities}', 'recovery-test')")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
         f"UPDATE items SET stock = stock - {ITEM_QTY} WHERE id = '{item}'")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
         f"INSERT INTO idempotency_keys (key, status_code, body) VALUES "
         f"('{stock_idem_key}', 200, '{cached_body_request}')")
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
          f"UPDATE sagas SET state = 'PAYMENT_REQUESTED' WHERE id = '{saga_id}'")
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
          f"UPDATE sagas SET state = 'ROLLBACK_REQUESTED' WHERE id = '{saga_id}'")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
          f"UPDATE items SET stock = stock + {ITEM_QTY} WHERE id = '{item}'")
 
-    _docker_exec_sql(STOCK_DB, "stock",
+    docker_exec_sql(STOCK_DB, "stock",
          f"INSERT INTO idempotency_keys (key, status_code, body) VALUES "
          f"('{stock_idem_key}', 200, '{cached_body_rollback}')")
 
-    _docker_exec_sql(ORDER_DB, "orders",
+    docker_exec_sql(ORDER_DB, "orders",
          f"UPDATE sagas SET state = 'ROLLED_BACK' WHERE id = '{saga_id}'")
 
-    _docker(f"docker start {ORDER_CONTAINER}")
+    docker_cmd(f"docker start {ORDER_CONTAINER}")
 
-    _wait_for_service(f"/orders/find/{order}", timeout=90)
+    wait_for_service(f"/orders/find/{order}", timeout=90)
     time.sleep(15)
 
     stock_val = json_field(api("GET", f"/stock/find/{item}"), "stock")
@@ -879,17 +846,17 @@ def test_coordinator_crash_after_rolled_back():
 # ---------------------------------------------------------------------------
 TESTS = [
     ("Transaction Saved in Idempotency ID: Checkout Successful, Nothing Changes", test_idempotency_saved),
-    # ("Order Already Paid: Checkout Fails, Nothing Changes", test_order_already_paid),
-    # ("Compensating Transaction: Payment Fails, Stock Rolled Back", test_compensation_payment_fails),
-    # ("Stock Reservation Fails — No Payment Attempted", test_stock_fails_no_payment),
-    # ("Participant Crash: Stock Dies Mid-Saga And Recovers", test_stock_crash_recovery),
-    # ("Participant Crash: Payment Dies Mid-Saga And Recovers", test_payment_crash_recovery),
-    # ("Coordinator Crash: Saga Crashes Before Stock Request", test_coordinator_crash_before_stock),
-    # ("Coordinator Crash: Saga Crashes After Stock Request", test_coordinator_crash_after_stock),
-    # ("Coordinator Crash: Saga Crashes Before Payment Request", test_coordinator_crash_before_payment),
-    # ("Coordinator Crash: Saga Crashes After Payment Request", test_coordinator_crash_after_payment),
-    # ("Coordinator Crash: Saga Crashes After Stock Failed", test_coordinator_crash_stock_failed),
-    # ("Coordinator Crash: Saga Crashes After Saga Completed", test_coordinator_crash_after_completed),
-    # ("Coordinator Crash: Saga Crashes After Rollback Requested", test_coordinator_crash_before_rolled_back),
-    # ("Coordinator Crash: Saga Crashes After Rollback Successful", test_coordinator_crash_after_rolled_back),
+    ("Order Already Paid: Checkout Fails, Nothing Changes", test_order_already_paid),
+    ("Compensating Transaction: Payment Fails, Stock Rolled Back", test_compensation_payment_fails),
+    ("Stock Reservation Fails — No Payment Attempted", test_stock_fails_no_payment),
+    ("Participant Crash: Stock Dies Mid-Saga And Recovers", test_stock_crash_recovery),
+    ("Participant Crash: Payment Dies Mid-Saga And Recovers", test_payment_crash_recovery),
+    ("Coordinator Crash: Saga Crashes Before Stock Request", test_coordinator_crash_before_stock),
+    ("Coordinator Crash: Saga Crashes After Stock Request", test_coordinator_crash_after_stock),
+    ("Coordinator Crash: Saga Crashes Before Payment Request", test_coordinator_crash_before_payment),
+    ("Coordinator Crash: Saga Crashes After Payment Request", test_coordinator_crash_after_payment),
+    ("Coordinator Crash: Saga Crashes After Stock Failed", test_coordinator_crash_stock_failed),
+    ("Coordinator Crash: Saga Crashes After Saga Completed", test_coordinator_crash_after_completed),
+    ("Coordinator Crash: Saga Crashes After Rollback Requested", test_coordinator_crash_before_rolled_back),
+    ("Coordinator Crash: Saga Crashes After Rollback Successful", test_coordinator_crash_after_rolled_back),
 ]
