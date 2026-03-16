@@ -51,6 +51,7 @@ def init_routes(app):
         if row is not None:
             user_id, amount = row
             cur.execute("SELECT credit FROM users WHERE id = %s FOR UPDATE", (user_id,))
+            # TODO: compensating payment and deleting prepared transaction should be atomic!
             if cur.fetchone() is not None:
                 cur.execute("UPDATE users SET credit = credit + %s WHERE id = %s", (amount, user_id))
             cur.execute("DELETE FROM prepared_transactions WHERE txn_id = %s", (txn_id,))

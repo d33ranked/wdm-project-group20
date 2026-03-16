@@ -314,7 +314,7 @@ def test_checkout_payment_votes_no():
 # ---------------------------------------------------------------------------
 # 11. Participant Crash — Stock Service Dies During Checkout, Recovers
 # ---------------------------------------------------------------------------
-def test_participant_crash_recovery():
+def test_stock_crash_recovery():
     """Stop stock service, restart after 3s, checkout retries and succeeds."""
     ITEM_PRICE = 10
     ITEM_QTY = 2
@@ -352,13 +352,53 @@ def test_participant_crash_recovery():
           f"Charged {ITEM_PRICE}×{ITEM_QTY}",
           credit == expected_credit, f"got {credit}")
 
+# ---------------------------------------------------------------------------
+# 12. Participant Crash — Payment Service Dies During Checkout, Recovers
+# ---------------------------------------------------------------------------
+def test_payment_crash_recovery():
+    """Stop stock service, restart after 3s, checkout retries and succeeds."""
+    ITEM_PRICE = 10
+    ITEM_QTY = 2
+    STOCK = 5
+    CREDIT = 100
+    CONTAINER = "wdm-project-group24-payment-service-1"
+
+    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    api("POST", f"/payment/add_funds/{user}/{CREDIT}")
+    item = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
+    api("POST", f"/stock/add/{item}/{STOCK}")
+    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+    api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
+
+    docker_cmd(f"docker stop {CONTAINER}")
+    subprocess.Popen(
+        f"sleep 3 && docker start {CONTAINER}",
+        shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+    r = api("POST", f"/orders/checkout/{order}")
+    expected_stock = STOCK - ITEM_QTY
+    expected_credit = CREDIT - (ITEM_PRICE * ITEM_QTY)
+
+    check("Checkout Completed After Payment Service Recovered — Order Service Retried Successfully",
+          r.status_code == 200, f"got {r.status_code}")
+
+    wait_for_service(f"/payment/find_user/{user}")
+    stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    credit = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
+
+    check(f"Stock Decreased To {expected_stock} After Recovery — {ITEM_QTY} Units Sold",
+          stock == expected_stock, f"got {stock}")
+    check(f"Credit Decreased To {expected_credit} After Recovery — "
+          f"Charged {ITEM_PRICE}×{ITEM_QTY}",
+          credit == expected_credit, f"got {credit}")
 
 # ---------------------------------------------------------------------------
-# 12. Coordinator Crash — Injected Stuck Transaction, Recovery On Startup
+# 13. Coordinator Crash — Crash At Started
 # ---------------------------------------------------------------------------
-def test_coordinator_crash_recovery():
+def test_crash_recovery_started():
     """
-    Surgically inject a stuck transaction_log row (status='preparing_payment')
+    Surgically inject a stuck transaction_log row (status='started')
     and a matching prepared_transaction in stock to simulate a coordinator crash
     mid-checkout. Restart the order service and verify recovery resolves it
     deterministically — no race-condition timing required.
@@ -372,7 +412,208 @@ def test_coordinator_crash_recovery():
     CREDIT = 200
     ORDER_CONTAINER = "wdm-project-group24-order-service-1"
     ORDER_DB = "wdm-project-group24-order-db-1"
+
+    # 1. Create resources via API
+    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    api("POST", f"/payment/add_funds/{user}/{CREDIT}")
+    item = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
+    api("POST", f"/stock/add/{item}/{STOCK}")
+    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+    api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
+
+    txn_id = f"recovery-test-{uuid.uuid4()}"
+    prepared_stock = json.dumps([])
+
+    docker_exec_sql(
+        ORDER_DB, "orders",
+        f"INSERT INTO transaction_log "
+        f"(txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) "
+        f"VALUES ('{txn_id}', '{order}', 'started', "
+        f"'{prepared_stock}', FALSE, '{user}', {ITEM_PRICE * ITEM_QTY});"
+    )
+
+    docker_cmd(f"docker restart {ORDER_CONTAINER}")
+    wait_for_service(f"/orders/find/{order}", timeout=90)
+    time.sleep(3)
+
+    stock_after = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    credit_after = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
+    paid_after = json_field(api("GET", f"/orders/find/{order}"), "paid")
+
+    check(
+        f"Stock Unchanged At {STOCK} After Recovery — Stock Was Never Prepared, Nothing To Reverse",
+        stock_after == STOCK,
+        f"got {stock_after}",
+    )
+    check(
+        f"Credit Unchanged At {CREDIT} — Payment Was Never Prepared, Nothing To Reverse",
+        credit_after == CREDIT,
+        f"got {credit_after}",
+    )
+    check(
+        "Order NOT Marked Paid — Recovery Correctly Aborted The In-Doubt Transaction",
+        paid_after is not True,
+        f"got paid={paid_after}",
+    )
+
+# ---------------------------------------------------------------------------
+# 14. Coordinator Crash — Crash At Preparing Stock
+# ---------------------------------------------------------------------------
+def test_crash_recovery_preparing_stock():
+    import uuid
+    import json
+
+    ITEM_PRICE = 20
+    ITEM_QTY = 2
+    STOCK = 10
+    CREDIT = 200
+    ORDER_CONTAINER = "wdm-project-group24-order-service-1"
+    ORDER_DB = "wdm-project-group24-order-db-1"
     STOCK_DB = "wdm-project-group24-stock-db-1"
+
+    # 1. Create resources via API
+    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    api("POST", f"/payment/add_funds/{user}/{CREDIT}")
+    item = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
+    api("POST", f"/stock/add/{item}/{STOCK}")
+    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+    api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
+
+    txn_id = f"recovery-test-{uuid.uuid4()}"
+    prepared_stock = json.dumps([{"item_id": item, "quantity": ITEM_QTY}])
+
+    docker_exec_sql(
+        ORDER_DB, "orders",
+        f"INSERT INTO transaction_log "
+        f"(txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) "
+        f"VALUES ('{txn_id}', '{order}', 'started', "
+        f"'{prepared_stock}', FALSE, '{user}', {ITEM_PRICE * ITEM_QTY});"
+    )
+
+    docker_exec_sql(ORDER_DB, "orders",
+        f"UPDATE transaction_log SET status = 'preparing_stock', prepared_stock = '{prepared_stock}' WHERE txn_id = '{txn_id}'")
+
+    docker_exec_sql(
+        STOCK_DB, "stock",
+        f"UPDATE items SET stock = stock - {ITEM_QTY} WHERE id = '{item}';"
+    )
+    docker_exec_sql(
+        STOCK_DB, "stock",
+        f"INSERT INTO prepared_transactions (txn_id, item_id, quantity) "
+        f"VALUES ('{txn_id}', '{item}', {ITEM_QTY});"
+    )
+
+    docker_cmd(f"docker restart {ORDER_CONTAINER}")
+    wait_for_service(f"/orders/find/{order}", timeout=90)
+    time.sleep(3)
+
+    stock_after = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    credit_after = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
+    paid_after = json_field(api("GET", f"/orders/find/{order}"), "paid")
+
+    check(
+        f"Stock Restored To {STOCK} After Recovery — ABORT Returned The {ITEM_QTY} Reserved Units",
+        stock_after == STOCK,
+        f"got {stock_after}",
+    )
+    check(
+        f"Credit Unchanged At {CREDIT} — Payment Was Never Prepared, Nothing To Reverse",
+        credit_after == CREDIT,
+        f"got {credit_after}",
+    )
+    check(
+        "Order NOT Marked Paid — Recovery Correctly Aborted The In-Doubt Transaction",
+        paid_after is not True,
+        f"got paid={paid_after}",
+    )
+
+# ---------------------------------------------------------------------------
+# 14. Coordinator Crash — Crash At Aborting Before Stock Deducted
+# ---------------------------------------------------------------------------
+def test_crash_recovery_abort_pre_stock():
+    import uuid
+    import json
+
+    ITEM_PRICE = 20
+    ITEM_QTY = 2
+    STOCK = 10
+    CREDIT = 200
+    ORDER_CONTAINER = "wdm-project-group24-order-service-1"
+    ORDER_DB = "wdm-project-group24-order-db-1"
+
+    # 1. Create resources via API
+    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    api("POST", f"/payment/add_funds/{user}/{CREDIT}")
+    item = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
+    api("POST", f"/stock/add/{item}/{STOCK}")
+    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+    api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
+
+    txn_id = f"recovery-test-{uuid.uuid4()}"
+    prepared_stock = json.dumps([{"item_id": item, "quantity": ITEM_QTY}])
+
+    docker_exec_sql(
+        ORDER_DB, "orders",
+        f"INSERT INTO transaction_log "
+        f"(txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) "
+        f"VALUES ('{txn_id}', '{order}', 'started', "
+        f"'{prepared_stock}', FALSE, '{user}', {ITEM_PRICE * ITEM_QTY});"
+    )
+
+    docker_exec_sql(ORDER_DB, "orders",
+        f"UPDATE transaction_log SET status = 'preparing_stock', prepared_stock = '{prepared_stock}' WHERE txn_id = '{txn_id}'")
+
+    docker_exec_sql(ORDER_DB, "orders",
+        f"UPDATE transaction_log SET status = 'aborting' WHERE txn_id = '{txn_id}'")
+
+    docker_cmd(f"docker restart {ORDER_CONTAINER}")
+    wait_for_service(f"/orders/find/{order}", timeout=90)
+    time.sleep(3)
+
+    stock_after = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    credit_after = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
+    paid_after = json_field(api("GET", f"/orders/find/{order}"), "paid")
+
+    check(
+        f"Stock Unchanged At {STOCK} After Recovery — Stock Failed, So Did Not Change",
+        stock_after == STOCK,
+        f"got {stock_after}",
+    )
+    check(
+        f"Credit Unchanged At {CREDIT} — Payment Was Never Prepared, Nothing To Reverse",
+        credit_after == CREDIT,
+        f"got {credit_after}",
+    )
+    check(
+        "Order NOT Marked Paid — Recovery Correctly Aborted The In-Doubt Transaction",
+        paid_after is not True,
+        f"got paid={paid_after}",
+    )
+
+# ---------------------------------------------------------------------------
+# 15. Coordinator Crash — Crash At Preparing Payment
+# ---------------------------------------------------------------------------
+def test_crash_recovery_preparing_payment():
+    """
+    Surgically inject a stuck transaction_log row (status='preparing_payment')
+    and a matching prepared_transaction in stock to simulate a coordinator crash
+    mid-checkout. Restart the order service and verify recovery resolves it
+    deterministically — no race-condition timing required.
+    """
+    import uuid
+    import json
+
+    ITEM_PRICE = 20
+    ITEM_QTY = 2
+    ORDER_PRICE = ITEM_PRICE * ITEM_QTY
+
+    STOCK = 10
+    CREDIT = 200
+    ORDER_CONTAINER = "wdm-project-group24-order-service-1"
+    ORDER_DB = "wdm-project-group24-order-db-1"
+    STOCK_DB = "wdm-project-group24-stock-db-1"
+    PAYMENT_DB = "wdm-project-group24-payment-db-1"
+
 
     # 1. Create resources via API
     user = json_field(api("POST", "/payment/create_user"), "user_id")
@@ -397,13 +638,19 @@ def test_coordinator_crash_recovery():
         f"INSERT INTO prepared_transactions (txn_id, item_id, quantity) "
         f"VALUES ('{txn_id}', '{item}', {ITEM_QTY});"
     )
-    #    Order: insert a transaction_log row stuck in 'preparing_payment'.
+
+    docker_exec_sql(PAYMENT_DB, "payments",
+        f"UPDATE users SET credit = credit - {ORDER_PRICE} WHERE id = '{user}'")
+    docker_exec_sql(
+        PAYMENT_DB, "payments",
+        f"INSERT INTO prepared_transactions (txn_id, user_id, amount) VALUES ('{txn_id}', '{user}', {ORDER_PRICE})")
+
     docker_exec_sql(
         ORDER_DB, "orders",
         f"INSERT INTO transaction_log "
         f"(txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) "
         f"VALUES ('{txn_id}', '{order}', 'preparing_payment', "
-        f"'{prepared_stock}', FALSE, '{user}', {ITEM_PRICE * ITEM_QTY});"
+        f"'{prepared_stock}', TRUE, '{user}', {ITEM_PRICE * ITEM_QTY});"
     )
 
     check(
@@ -437,12 +684,314 @@ def test_coordinator_crash_recovery():
         f"got {stock_after}",
     )
     check(
+        f"Credit Restored To {CREDIT} — ABORT Returned Credits",
+        credit_after == CREDIT,
+        f"got {credit_after}",
+    )
+    check(
+        "Order NOT Marked Paid — Recovery Correctly Aborted The In-Doubt Transaction",
+        paid_after is not True,
+        f"got paid={paid_after}",
+    )
+
+# ---------------------------------------------------------------------------
+# 16. Coordinator Crash — Crash At Committing
+# ---------------------------------------------------------------------------
+def test_crash_recovery_committing():
+    import uuid
+    import json
+
+    ITEM_PRICE = 20
+    ITEM_QTY = 2
+    ORDER_PRICE = ITEM_PRICE * ITEM_QTY
+
+    STOCK = 10
+    CREDIT = 200
+    ORDER_CONTAINER = "wdm-project-group24-order-service-1"
+    ORDER_DB = "wdm-project-group24-order-db-1"
+    STOCK_DB = "wdm-project-group24-stock-db-1"
+    PAYMENT_DB = "wdm-project-group24-payment-db-1"
+
+    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    api("POST", f"/payment/add_funds/{user}/{CREDIT}")
+    item = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
+    api("POST", f"/stock/add/{item}/{STOCK}")
+    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+    api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
+
+    txn_id = f"recovery-test-{uuid.uuid4()}"
+    prepared_stock = json.dumps([{"item_id": item, "quantity": ITEM_QTY}])
+
+    docker_exec_sql(
+        STOCK_DB, "stock",
+        f"UPDATE items SET stock = stock - {ITEM_QTY} WHERE id = '{item}';"
+    )
+    docker_exec_sql(
+        STOCK_DB, "stock",
+        f"INSERT INTO prepared_transactions (txn_id, item_id, quantity) "
+        f"VALUES ('{txn_id}', '{item}', {ITEM_QTY});"
+    )
+
+    docker_exec_sql(PAYMENT_DB, "payments",
+        f"UPDATE users SET credit = credit - {ORDER_PRICE} WHERE id = '{user}'")
+    docker_exec_sql(
+        PAYMENT_DB, "payments",
+        f"INSERT INTO prepared_transactions (txn_id, user_id, amount) VALUES ('{txn_id}', '{user}', {ORDER_PRICE})")
+
+    docker_exec_sql(
+        ORDER_DB, "orders",
+        f"INSERT INTO transaction_log "
+        f"(txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) "
+        f"VALUES ('{txn_id}', '{order}', 'committing', "
+        f"'{prepared_stock}', TRUE, '{user}', {ITEM_PRICE * ITEM_QTY});"
+    )
+
+    check(
+        "Stuck Transaction Injected Into DB — "
+        f"txn={txn_id[:8]}... status=preparing_payment, stock reduced by {ITEM_QTY}",
+        True,
+    )
+
+    stock_before = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    check(
+        f"Stock Reads {STOCK - ITEM_QTY} After Injection — Confirms PREPARE Deduction Is Visible",
+        stock_before == STOCK - ITEM_QTY,
+        f"got {stock_before}",
+    )
+
+    docker_cmd(f"docker restart {ORDER_CONTAINER}")
+    wait_for_service(f"/orders/find/{order}", timeout=90)
+    time.sleep(3)
+
+    expected_stock = STOCK - ITEM_QTY
+    expected_credit = CREDIT - ITEM_QTY * ITEM_PRICE
+
+    stock_after = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    credit_after = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
+    paid_after = json_field(api("GET", f"/orders/find/{order}"), "paid")
+
+    check(
+        f"Stock Reduced To {expected_stock} After Recovery — Committing is Completed",
+        stock_after == expected_stock,
+        f"got {stock_after}",
+    )
+    check(
+        f"Credit Reduced To {expected_credit} — Committing is Completed",
+        credit_after == expected_credit,
+        f"got {credit_after}",
+    )
+    check(
+        "Order Marked As Paid — Committing is Completed",
+        paid_after is True,
+        f"got paid={paid_after}",
+    )
+
+# ---------------------------------------------------------------------------
+# 17. Coordinator Crash — Crash At Aborting After Stock Deducted
+# ---------------------------------------------------------------------------
+def test_crash_recovery_abort_post_stock():
+    import uuid
+    import json
+
+    ITEM_PRICE = 20
+    ITEM_QTY = 2
+
+    STOCK = 10
+    CREDIT = 200
+    ORDER_CONTAINER = "wdm-project-group24-order-service-1"
+    ORDER_DB = "wdm-project-group24-order-db-1"
+    STOCK_DB = "wdm-project-group24-stock-db-1"
+
+    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    api("POST", f"/payment/add_funds/{user}/{CREDIT}")
+    item = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
+    api("POST", f"/stock/add/{item}/{STOCK}")
+    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+    api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
+
+    txn_id = f"recovery-test-{uuid.uuid4()}"
+    prepared_stock = json.dumps([{"item_id": item, "quantity": ITEM_QTY}])
+
+    docker_exec_sql(
+        STOCK_DB, "stock",
+        f"UPDATE items SET stock = stock - {ITEM_QTY} WHERE id = '{item}';"
+    )
+    docker_exec_sql(
+        STOCK_DB, "stock",
+        f"INSERT INTO prepared_transactions (txn_id, item_id, quantity) "
+        f"VALUES ('{txn_id}', '{item}', {ITEM_QTY});"
+    )
+
+    docker_exec_sql(
+        ORDER_DB, "orders",
+        f"INSERT INTO transaction_log "
+        f"(txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) "
+        f"VALUES ('{txn_id}', '{order}', 'aborting', "
+        f"'{prepared_stock}', TRUE, '{user}', {ITEM_PRICE * ITEM_QTY});"
+    )
+
+    check(
+        "Stuck Transaction Injected Into DB — "
+        f"txn={txn_id[:8]}... status=preparing_payment, stock reduced by {ITEM_QTY}",
+        True,
+    )
+
+    stock_before = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    check(
+        f"Stock Reads {STOCK - ITEM_QTY} After Injection — Confirms PREPARE Deduction Is Visible",
+        stock_before == STOCK - ITEM_QTY,
+        f"got {stock_before}",
+    )
+
+    docker_cmd(f"docker restart {ORDER_CONTAINER}")
+    wait_for_service(f"/orders/find/{order}", timeout=90)
+    time.sleep(3)
+
+    stock_after = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    credit_after = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
+    paid_after = json_field(api("GET", f"/orders/find/{order}"), "paid")
+
+    check(
+        f"Stock Restored To {STOCK} After Recovery — Aborting Restored Original",
+        stock_after == STOCK,
+        f"got {stock_after}",
+    )
+    check(
         f"Credit Unchanged At {CREDIT} — Payment Was Never Prepared, Nothing To Reverse",
         credit_after == CREDIT,
         f"got {credit_after}",
     )
     check(
         "Order NOT Marked Paid — Recovery Correctly Aborted The In-Doubt Transaction",
+        paid_after is not True,
+        f"got paid={paid_after}",
+    )
+
+# ---------------------------------------------------------------------------
+# 18. Coordinator Crash — Crash At Committed
+# ---------------------------------------------------------------------------
+def test_crash_recovery_committed():
+    import uuid
+    import json
+
+    ITEM_PRICE = 20
+    ITEM_QTY = 2
+    ORDER_PRICE = ITEM_PRICE * ITEM_QTY
+
+    STOCK = 10
+    CREDIT = 200
+    ORDER_CONTAINER = "wdm-project-group24-order-service-1"
+    ORDER_DB = "wdm-project-group24-order-db-1"
+    STOCK_DB = "wdm-project-group24-stock-db-1"
+    PAYMENT_DB = "wdm-project-group24-payment-db-1"
+
+    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    api("POST", f"/payment/add_funds/{user}/{CREDIT}")
+    item = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
+    api("POST", f"/stock/add/{item}/{STOCK}")
+    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+    api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
+
+    txn_id = f"recovery-test-{uuid.uuid4()}"
+    prepared_stock = json.dumps([{"item_id": item, "quantity": ITEM_QTY}])
+
+    docker_exec_sql(
+        STOCK_DB, "stock",
+        f"UPDATE items SET stock = stock - {ITEM_QTY} WHERE id = '{item}';"
+    )
+    docker_exec_sql(PAYMENT_DB, "payments",
+    f"UPDATE users SET credit = credit - {ORDER_PRICE} WHERE id = '{user}'")
+
+    docker_exec_sql(
+        ORDER_DB, "orders",
+        f"INSERT INTO transaction_log "
+        f"(txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) "
+        f"VALUES ('{txn_id}', '{order}', 'committed', "
+        f"'{prepared_stock}', TRUE, '{user}', {ITEM_PRICE * ITEM_QTY});"
+    )
+    docker_exec_sql(ORDER_DB, "orders",
+        f"UPDATE orders SET paid = TRUE WHERE id = '{order}'")
+
+    docker_cmd(f"docker restart {ORDER_CONTAINER}")
+    wait_for_service(f"/orders/find/{order}", timeout=90)
+    time.sleep(3)
+
+    expected_stock = STOCK - ITEM_QTY
+    expected_credit = CREDIT - ORDER_PRICE
+
+    stock_after = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    credit_after = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
+    paid_after = json_field(api("GET", f"/orders/find/{order}"), "paid")
+
+    check(
+        f"Stock Deducted To {expected_stock} After Recovery — Transaction Was Already Committed: No Change",
+        stock_after == expected_stock,
+        f"got {stock_after}",
+    )
+    check(
+        f"Credit Deducted To {expected_credit} After Recovery — Transaction Was Already Committed: No Change",
+        credit_after == expected_credit,
+        f"got {credit_after}",
+    )
+    check(
+        "Order Marked As Paid — Transaction Was Already Committed: No Change",
+        paid_after is True,
+        f"got paid={paid_after}",
+    )
+
+# ---------------------------------------------------------------------------
+# 19. Coordinator Crash — Crash At Aborted
+# ---------------------------------------------------------------------------
+def test_crash_recovery_aborted():
+    import uuid
+    import json
+
+    ITEM_PRICE = 20
+    ITEM_QTY = 2
+
+    STOCK = 10
+    CREDIT = 200
+    ORDER_CONTAINER = "wdm-project-group24-order-service-1"
+    ORDER_DB = "wdm-project-group24-order-db-1"
+
+    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    api("POST", f"/payment/add_funds/{user}/{CREDIT}")
+    item = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
+    api("POST", f"/stock/add/{item}/{STOCK}")
+    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+    api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
+
+    txn_id = f"recovery-test-{uuid.uuid4()}"
+    prepared_stock = json.dumps([{"item_id": item, "quantity": ITEM_QTY}])
+
+    docker_exec_sql(
+        ORDER_DB, "orders",
+        f"INSERT INTO transaction_log "
+        f"(txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) "
+        f"VALUES ('{txn_id}', '{order}', 'aborted', "
+        f"'{prepared_stock}', TRUE, '{user}', {ITEM_PRICE * ITEM_QTY});"
+    )
+
+    docker_cmd(f"docker restart {ORDER_CONTAINER}")
+    wait_for_service(f"/orders/find/{order}", timeout=90)
+    time.sleep(3)
+
+    stock_after = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    credit_after = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
+    paid_after = json_field(api("GET", f"/orders/find/{order}"), "paid")
+
+    check(
+        f"Stock Restored To {STOCK} After Recovery — Transaction Was Already Aborted: No Change",
+        stock_after == STOCK,
+        f"got {stock_after}",
+    )
+    check(
+        f"Credit Restored To {CREDIT} After Recovery — Transaction Was Already Aborted: No Change",
+        credit_after == CREDIT,
+        f"got {credit_after}",
+    )
+    check(
+        "Order Marked As NOT Paid — Transaction Was Already Aborted: No Change",
         paid_after is not True,
         f"got paid={paid_after}",
     )
@@ -462,6 +1011,14 @@ TESTS = [
     ("ABORT On Non-Existent And Already-Committed Transactions", test_abort_safety),
     ("2PC Checkout: Stock Votes NO, Coordinator Aborts All", test_checkout_stock_votes_no),
     ("2PC Checkout: Payment Votes NO, Stock Reservation Rolled Back", test_checkout_payment_votes_no),
-    ("Participant Crash: Stock Dies Mid-Checkout And Recovers", test_participant_crash_recovery),
-    ("Coordinator Crash: Order Service Killed After PREPARE, Recovers Consistently", test_coordinator_crash_recovery),
+    ("Participant Crash: Stock Dies Mid-Checkout And Recovers", test_stock_crash_recovery),
+    ("Participant Crash: Payment Dies Mid-Checkout And Recovers", test_payment_crash_recovery),
+    ("Coordinator Crash: Order Service Killed at Start, Recovers Consistently", test_crash_recovery_started),
+    ("Coordinator Crash: Order Service Killed at Preparing Stock, Recovers Consistently", test_crash_recovery_preparing_stock),
+    ("Coordinator Crash: Order Service Killed at Aborting Before Stock Deducted, Recovers Consistently", test_crash_recovery_abort_pre_stock),
+    ("Coordinator Crash: Order Service Killed After Preparing Payment, Recovers Consistently", test_crash_recovery_preparing_payment),
+    ("Coordinator Crash: Order Service Killed at Committing, Recovers Consistently", test_crash_recovery_committing),
+    ("Coordinator Crash: Order Service Killed at Aborting After Stock Deducated, Recovers Consistently", test_crash_recovery_abort_post_stock),
+    ("Coordinator Crash: Order Service Killed at Committed, Recovers Consistently", test_crash_recovery_committed),
+    ("Coordinator Crash: Order Service Killed at Aborted, Recovers Consistently", test_crash_recovery_aborted),
 ]

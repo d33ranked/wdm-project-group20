@@ -88,6 +88,7 @@ def init_routes(app):
     def abort_transaction(txn_id: str):
         cur = g.conn.cursor()
         cur.execute("SELECT item_id, quantity FROM prepared_transactions WHERE txn_id = %s", (txn_id,))
+        # TODO: compensating stock and deleting prepared transaction should be atomic!
         for item_id, quantity in cur.fetchall():
             cur.execute("UPDATE items SET stock = stock + %s WHERE id = %s", (quantity, item_id))
         cur.execute("DELETE FROM prepared_transactions WHERE txn_id = %s", (txn_id,))

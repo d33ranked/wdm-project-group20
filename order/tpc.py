@@ -112,11 +112,14 @@ def checkout_tpc(order_id):
         conn.commit()
 
         # Step 3: Prepare All Stock Items In One Batch Request
-        cur.execute("UPDATE transaction_log SET status = 'preparing_stock' WHERE txn_id = %s", (txn_id,))
-        conn.commit()
 
         batch_items = [{"item_id": iid, "quantity": qty} for iid, qty in sorted(items_quantities.items())]
         prepared_stock = [[e["item_id"], e["quantity"]] for e in batch_items]
+
+        # Persist Prepared Items For Crash Recovery
+        cur.execute("UPDATE transaction_log SET status = 'preparing_stock', prepared_stock = %s WHERE txn_id = %s",
+                    (json.dumps(prepared_stock), txn_id))
+        conn.commit()
 
         stock_reply = send_post_request(
             f"{GATEWAY_URL}/stock/prepare_batch/{txn_id}",
@@ -132,13 +135,8 @@ def checkout_tpc(order_id):
             conn.commit()
             abort(400, "Failed to PREPARE stock")
 
-        # Persist Prepared Items For Crash Recovery
-        cur.execute("UPDATE transaction_log SET prepared_stock = %s WHERE txn_id = %s",
-                    (json.dumps(prepared_stock), txn_id))
-        conn.commit()
-
         # Step 4: Prepare Payment
-        cur.execute("UPDATE transaction_log SET status = 'preparing_payment' WHERE txn_id = %s", (txn_id,))
+        cur.execute("UPDATE transaction_log SET status = 'preparing_payment', prepared_payment = TRUE WHERE txn_id = %s", (txn_id,))
         conn.commit()
 
         payment_reply = send_post_request(
@@ -154,15 +152,13 @@ def checkout_tpc(order_id):
             conn.commit()
             abort(400, "Failed to PREPARE payment")
 
-        cur.execute("UPDATE transaction_log SET prepared_payment = TRUE WHERE txn_id = %s", (txn_id,))
-        conn.commit()
-
         # Step 5: Commit (Decision Is Final Once 'committing' Is Persisted)
         cur.execute("UPDATE transaction_log SET status = 'committing' WHERE txn_id = %s", (txn_id,))
         conn.commit()
 
         commit_tpc(txn_id, prepared_stock, True)
 
+        # TODO these two should probably also be atomic!
         cur.execute("UPDATE orders SET paid = TRUE WHERE id = %s", (order_id,))
         cur.execute("UPDATE transaction_log SET status = 'committed' WHERE txn_id = %s", (txn_id,))
         conn.commit()
