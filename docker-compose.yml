@@ -1,6 +1,8 @@
 services:
   api-gateway:
-    build: ./gateway
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
     image: gateway:latest
     restart: on-failure
     ports:
@@ -11,10 +13,14 @@ services:
       - REQUEST_TIMEOUT_MS=30000
       - KAFKA_BOOTSTRAP_SERVERS=kafka-external:9092
     depends_on:
-      - kafka-external
-      - order-service
-      - stock-service
-      - payment-service
+      kafka-external:
+        condition: service_healthy
+      order-service:
+        condition: service_started
+      stock-service:
+        condition: service_started
+      payment-service:
+        condition: service_started
 
   nginx:
     image: nginx:1.25-bookworm
@@ -28,21 +34,27 @@ services:
       - payment-service
 
   order-service:
-    build: ./order
+    build:
+      context: .
+      dockerfile: order/Dockerfile
     image: order:latest
     restart: on-failure
     environment:
       - TRANSACTION_MODE=SAGA
       - GATEWAY_URL=http://nginx:80
+      - STOCK_SERVICE_URL=http://stock-service:5000
       - KAFKA_BOOTSTRAP_SERVERS=kafka-external:9092
       - INTERNAL_KAFKA_BOOTSTRAP_SERVERS=kafka-internal:9092
     command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_db.env
     depends_on:
-      - order-db
-      - kafka-external
-      - kafka-internal
+      order-db:
+        condition: service_healthy
+      kafka-external:
+        condition: service_healthy
+      kafka-internal:
+        condition: service_healthy
 
   order-db:
     image: postgres
@@ -52,9 +64,17 @@ services:
       - POSTGRES_DB=orders
     volumes:
       - ./order/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d orders"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
   stock-service:
-    build: ./stock
+    build:
+      context: .
+      dockerfile: stock/Dockerfile
     image: stock:latest
     restart: on-failure
     environment:
@@ -65,9 +85,12 @@ services:
     env_file:
       - env/stock_db.env
     depends_on:
-      - stock-db
-      - kafka-external
-      - kafka-internal
+      stock-db:
+        condition: service_healthy
+      kafka-external:
+        condition: service_healthy
+      kafka-internal:
+        condition: service_healthy
 
   stock-db:
     image: postgres
@@ -77,9 +100,17 @@ services:
       - POSTGRES_DB=stock
     volumes:
       - ./stock/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d stock"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
   payment-service:
-    build: ./payment
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
     image: payment:latest
     restart: on-failure
     environment:
@@ -90,9 +121,12 @@ services:
     env_file:
       - env/payment_db.env
     depends_on:
-      - payment-db
-      - kafka-external
-      - kafka-internal
+      payment-db:
+        condition: service_healthy
+      kafka-external:
+        condition: service_healthy
+      kafka-internal:
+        condition: service_healthy
 
   payment-db:
     image: postgres
@@ -102,6 +136,12 @@ services:
       - POSTGRES_DB=payments
     volumes:
       - ./payment/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d payments"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
   kafka-external:
     image: apache/kafka:latest
@@ -125,6 +165,12 @@ services:
       - env/kafka.env
     volumes:
       - kafka_data:/apache/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
 
   kafka-internal:
     image: apache/kafka:latest
@@ -146,14 +192,22 @@ services:
       - KAFKA_NUM_PARTITIONS=3
     volumes:
       - kafka_internal_data:/apache/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     ports:
       - "8080:8080"
     depends_on:
-      - kafka-external
-      - kafka-internal
+      kafka-external:
+        condition: service_healthy
+      kafka-internal:
+        condition: service_healthy
     environment:
       - KAFKA_CLUSTERS_0_NAME=external
       - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka-external:9092

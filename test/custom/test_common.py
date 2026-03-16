@@ -81,8 +81,8 @@ def test_double_checkout():
     credit_after_first = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
 
     r2 = api("POST", f"/orders/checkout/{order}")
-    check("Second Checkout On The Same Paid Order Is Rejected",
-          r2.status_code != 200 or True)
+    check("Second Checkout On A Paid Order Is Skipped",
+          r2.status_code == 200, f"got {r2.status_code}")
 
     stock_now = json_field(api("GET", f"/stock/find/{item}"), "stock")
     credit_now = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
@@ -145,8 +145,8 @@ def test_checkout_empty_order():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
 
     r = api("POST", f"/orders/checkout/{order}")
-    check("Empty Order Checkout Does Not Cause A Server Error (No 5xx)",
-          r.status_code < 500, f"got {r.status_code}")
+    check("Empty Order Checkout Is Skipped",
+          r.status_code == 200, f"got {r.status_code}")
 
 
 # ---------------------------------------------------------------------------
@@ -479,21 +479,107 @@ def test_find_nonexistent():
 
 
 # ---------------------------------------------------------------------------
+# 15. addItem Idempotency — Same Key Sent Twice, Quantity Added Once
+# ---------------------------------------------------------------------------
+def test_add_item_idempotency():
+    """Sending the same addItem request twice with the same idempotency key
+    must add the item only once — no quantity doubling, no cost doubling."""
+    PRICE = 10
+    STOCK = 5
+
+    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    item = json_field(api("POST", f"/stock/item/create/{PRICE}"), "item_id")
+    api("POST", f"/stock/add/{item}/{STOCK}")
+    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+
+    headers = {"Idempotency-Key": "add-item-idem-test-001"}
+
+    r1 = api("POST", f"/orders/addItem/{order}/{item}/2", headers=headers)
+    check("First addItem With Idempotency Key Succeeds",
+          r1.status_code == 200, f"got {r1.status_code}")
+
+    r2 = api("POST", f"/orders/addItem/{order}/{item}/2", headers=headers)
+    check("Second addItem With Same Idempotency Key Returns 200 — Cached, Not Re-Applied",
+          r2.status_code == 200, f"got {r2.status_code}")
+
+    check("Both Responses Are Identical — Confirms Second Was Served From Cache",
+          r1.text == r2.text, f"r1={r1.text!r} r2={r2.text!r}")
+
+    order_data = api("GET", f"/orders/find/{order}").json()
+    items = order_data.get("items", [])
+    total_cost = order_data.get("total_cost", 0)
+
+    quantity_in_order = sum(q for (iid, q) in items if iid == item)
+    check("Order Contains Item With Quantity 2 — Not 4 (Not Added Twice)",
+          quantity_in_order == 2, f"got quantity={quantity_in_order}")
+    check(f"Total Cost Is {PRICE * 2} — Reflects One addItem Call, Not Two",
+          total_cost == PRICE * 2, f"got total_cost={total_cost}")
+
+
+# ---------------------------------------------------------------------------
+# 16. Multi-Item Checkout Atomic Rollback — One Item Out Of Stock
+# ---------------------------------------------------------------------------
+def test_multi_item_checkout_partial_stock_failure():
+    """Order has 3 items; the second item has 0 stock.
+    Checkout must fail AND all stock levels must stay unchanged —
+    no partial deduction from the items that did have stock."""
+    CREDIT = 1000
+
+    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    api("POST", f"/payment/add_funds/{user}/{CREDIT}")
+
+    item1 = json_field(api("POST", "/stock/item/create/10"), "item_id")
+    api("POST", f"/stock/add/{item1}/5")               # has stock
+
+    item2 = json_field(api("POST", "/stock/item/create/20"), "item_id")
+    # deliberately leave item2 at 0 stock — no add_funds call
+
+    item3 = json_field(api("POST", "/stock/item/create/30"), "item_id")
+    api("POST", f"/stock/add/{item3}/5")               # has stock
+
+    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+    api("POST", f"/orders/addItem/{order}/{item1}/2")
+    api("POST", f"/orders/addItem/{order}/{item2}/1")  # will cause the failure
+    api("POST", f"/orders/addItem/{order}/{item3}/1")
+
+    r = api("POST", f"/orders/checkout/{order}")
+    check("Checkout Rejected — Item2 Has 0 Stock, Entire Batch Must Fail",
+          400 <= r.status_code < 500, f"got {r.status_code}")
+
+    s1 = json_field(api("GET", f"/stock/find/{item1}"), "stock")
+    s2 = json_field(api("GET", f"/stock/find/{item2}"), "stock")
+    s3 = json_field(api("GET", f"/stock/find/{item3}"), "stock")
+
+    check("Item1 Stock Still 5 — Not Partially Deducted Despite Having Enough Stock",
+          s1 == 5, f"got {s1}")
+    check("Item2 Stock Still 0 — Confirms It Was The Cause Of Failure",
+          s2 == 0, f"got {s2}")
+    check("Item3 Stock Still 5 — Not Partially Deducted Despite Having Enough Stock",
+          s3 == 5, f"got {s3}")
+
+    balance = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
+    check(f"User Balance Unchanged At {CREDIT} — Not Charged For A Failed Checkout",
+          balance == CREDIT, f"got {balance}")
+
+
+# ---------------------------------------------------------------------------
 # Ordered test list — imported by run.py
 # ---------------------------------------------------------------------------
 TESTS = [
-    # ("Multi-Item Checkout With Per-Item Stock Verification", test_multi_item_checkout),
-    # ("Double Checkout On A Paid Order", test_double_checkout),
-    # ("Add Items To A Paid Order And Re-Checkout", test_post_checkout_tampering),
-    # ("Checkout An Empty Order (No Items)", test_checkout_empty_order),
-    # ("10 Concurrent Checkouts For 1 Unit Of Stock", test_concurrent_fight_for_last_item),
-    # ("Sequential Checkouts Until Stock Exhausted", test_sequential_drain),
-    # ("5 Independent Checkouts In Parallel", test_concurrent_independent_checkouts),
-    # ("External Stock Change Between Order And Checkout", test_stock_modified_before_checkout),
-    # ("Fund User After Order Creation, Then Checkout", test_fund_user_after_order),
-    # ("Boundary: Balance Exactly Equals Order Total", test_exact_balance_boundary),
-    # ("Boundary: Stock Exactly Equals Order Quantity", test_exact_stock_boundary),
-    # ("Boundary: One Credit Short Of Order Total", test_one_credit_short),
-    # ("Boundary: One Stock Unit Short Of Order Quantity", test_one_stock_short),
-    # ("GET On Non-Existent Stock, User, And Order IDs", test_find_nonexistent),
+    ("Multi-Item Checkout With Per-Item Stock Verification", test_multi_item_checkout),
+    ("Double Checkout On A Paid Order", test_double_checkout),
+    ("Add Items To A Paid Order And Re-Checkout", test_post_checkout_tampering),
+    ("Checkout An Empty Order (No Items)", test_checkout_empty_order),
+    ("10 Concurrent Checkouts For 1 Unit Of Stock", test_concurrent_fight_for_last_item),
+    ("Sequential Checkouts Until Stock Exhausted", test_sequential_drain),
+    ("5 Independent Checkouts In Parallel", test_concurrent_independent_checkouts),
+    ("External Stock Change Between Order And Checkout", test_stock_modified_before_checkout),
+    ("Fund User After Order Creation, Then Checkout", test_fund_user_after_order),
+    ("Boundary: Balance Exactly Equals Order Total", test_exact_balance_boundary),
+    ("Boundary: Stock Exactly Equals Order Quantity", test_exact_stock_boundary),
+    ("Boundary: One Credit Short Of Order Total", test_one_credit_short),
+    ("Boundary: One Stock Unit Short Of Order Quantity", test_one_stock_short),
+    ("GET On Non-Existent Stock, User, And Order IDs", test_find_nonexistent),
+    ("addItem Idempotency — Same Key Prevents Duplicate Quantity", test_add_item_idempotency),
+    ("Multi-Item Checkout Atomic Rollback When One Item Is Out Of Stock", test_multi_item_checkout_partial_stock_failure),
 ]

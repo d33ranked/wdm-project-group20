@@ -11,34 +11,7 @@ import subprocess
 import threading
 import time
 
-import requests
-
-from run import api, check, json_field, PROJECT_ROOT, BASE_URL
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def _docker(cmd: str):
-    """Run a docker command silently."""
-    subprocess.run(
-        cmd, shell=True, cwd=PROJECT_ROOT,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-
-
-def _wait_for_service(probe_path: str, timeout: int = 60):
-    """Poll until a service endpoint responds with a non-5xx status."""
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            r = requests.get(f"{BASE_URL}{probe_path}", timeout=3)
-            if r.status_code < 500:
-                return True
-        except Exception:
-            pass
-        time.sleep(2)
-    return False
+from run import api, check, json_field, PROJECT_ROOT, docker_cmd, docker_exec_sql, wait_for_service
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +329,7 @@ def test_participant_crash_recovery():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    _docker(f"docker stop {CONTAINER}")
+    docker_cmd(f"docker stop {CONTAINER}")
     subprocess.Popen(
         f"sleep 3 && docker start {CONTAINER}",
         shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -369,7 +342,7 @@ def test_participant_crash_recovery():
     check("Checkout Completed After Stock Service Recovered — Order Service Retried Successfully",
           r.status_code == 200, f"got {r.status_code}")
 
-    _wait_for_service(f"/stock/find/{item}")
+    wait_for_service(f"/stock/find/{item}")
     stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
     credit = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
 
@@ -381,16 +354,27 @@ def test_participant_crash_recovery():
 
 
 # ---------------------------------------------------------------------------
-# 12. Coordinator Crash — Order Service Killed After PREPARE, Recovery On Startup
+# 12. Coordinator Crash — Injected Stuck Transaction, Recovery On Startup
 # ---------------------------------------------------------------------------
 def test_coordinator_crash_recovery():
-    """Kill the coordinator mid-checkout, restart, verify consistent final state."""
+    """
+    Surgically inject a stuck transaction_log row (status='preparing_payment')
+    and a matching prepared_transaction in stock to simulate a coordinator crash
+    mid-checkout. Restart the order service and verify recovery resolves it
+    deterministically — no race-condition timing required.
+    """
+    import uuid
+    import json
+
     ITEM_PRICE = 20
     ITEM_QTY = 2
     STOCK = 10
     CREDIT = 200
     ORDER_CONTAINER = "wdm-project-group24-order-service-1"
+    ORDER_DB = "wdm-project-group24-order-db-1"
+    STOCK_DB = "wdm-project-group24-stock-db-1"
 
+    # 1. Create resources via API
     user = json_field(api("POST", "/payment/create_user"), "user_id")
     api("POST", f"/payment/add_funds/{user}/{CREDIT}")
     item = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
@@ -398,52 +382,70 @@ def test_coordinator_crash_recovery():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    checkout_done = threading.Event()
+    txn_id = f"recovery-test-{uuid.uuid4()}"
+    prepared_stock = json.dumps([{"item_id": item, "quantity": ITEM_QTY}])
 
-    def do_checkout():
-        try:
-            api("POST", f"/orders/checkout/{order}")
-        except Exception:
-            pass
-        checkout_done.set()
-
-    t = threading.Thread(target=do_checkout, daemon=True)
-    t.start()
-
-    time.sleep(0.3)
-    _docker(f"docker kill {ORDER_CONTAINER}")
-
-    checkout_done.wait(timeout=35)
-
-    time.sleep(2)
-    _docker(f"docker start {ORDER_CONTAINER}")
-
-    _wait_for_service(f"/orders/find/{order}", timeout=90)
-    time.sleep(5)
-
-    stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
-    credit = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
-    paid = json_field(api("GET", f"/orders/find/{order}"), "paid")
-
-    expected_stock = STOCK - ITEM_QTY
-    expected_credit = CREDIT - (ITEM_PRICE * ITEM_QTY)
-
-    committed = (stock == expected_stock and credit == expected_credit and paid is True)
-    rolled_back = (stock == STOCK and credit == CREDIT and paid is not True)
-
-    check(
-        "After Coordinator Crash And Recovery, State Is Consistent — "
-        "Either Fully Committed Or Fully Rolled Back",
-        committed or rolled_back,
-        f"stock={stock}, credit={credit}, paid={paid}"
+    # 2. Inject stuck state directly into DBs — simulates coordinator crashed
+    #    after stock PREPARE succeeded but before payment PREPARE was sent.
+    #    Stock: deduct units and record prepared_transaction (as PREPARE does).
+    docker_exec_sql(
+        STOCK_DB, "stock",
+        f"UPDATE items SET stock = stock - {ITEM_QTY} WHERE id = '{item}';"
+    )
+    docker_exec_sql(
+        STOCK_DB, "stock",
+        f"INSERT INTO prepared_transactions (txn_id, item_id, quantity) "
+        f"VALUES ('{txn_id}', '{item}', {ITEM_QTY});"
+    )
+    #    Order: insert a transaction_log row stuck in 'preparing_payment'.
+    docker_exec_sql(
+        ORDER_DB, "orders",
+        f"INSERT INTO transaction_log "
+        f"(txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) "
+        f"VALUES ('{txn_id}', '{order}', 'preparing_payment', "
+        f"'{prepared_stock}', FALSE, '{user}', {ITEM_PRICE * ITEM_QTY});"
     )
 
-    if committed:
-        check("Recovery Resolved In-Doubt Transaction By Committing — "
-              "Stock, Credit, And Order All Reflect The Checkout", True)
-    elif rolled_back:
-        check("Recovery Resolved In-Doubt Transaction By Rolling Back — "
-              "All Participants Restored To Original State", True)
+    check(
+        "Stuck Transaction Injected Into DB — "
+        f"txn={txn_id[:8]}... status=preparing_payment, stock reduced by {ITEM_QTY}",
+        True,
+    )
+
+    stock_before = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    check(
+        f"Stock Reads {STOCK - ITEM_QTY} After Injection — Confirms PREPARE Deduction Is Visible",
+        stock_before == STOCK - ITEM_QTY,
+        f"got {stock_before}",
+    )
+
+    # 3. Restart the order service — recovery_tpc runs on startup.
+    docker_cmd(f"docker restart {ORDER_CONTAINER}")
+    wait_for_service(f"/orders/find/{order}", timeout=90)
+    time.sleep(3)
+
+    # 4. Verify recovery resolved the stuck transaction.
+    #    status='preparing_payment' → recovery aborts (stock not committed yet,
+    #    payment never started) → stock returned, order NOT paid.
+    stock_after = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    credit_after = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
+    paid_after = json_field(api("GET", f"/orders/find/{order}"), "paid")
+
+    check(
+        f"Stock Restored To {STOCK} After Recovery — ABORT Returned The {ITEM_QTY} Reserved Units",
+        stock_after == STOCK,
+        f"got {stock_after}",
+    )
+    check(
+        f"Credit Unchanged At {CREDIT} — Payment Was Never Prepared, Nothing To Reverse",
+        credit_after == CREDIT,
+        f"got {credit_after}",
+    )
+    check(
+        "Order NOT Marked Paid — Recovery Correctly Aborted The In-Doubt Transaction",
+        paid_after is not True,
+        f"got paid={paid_after}",
+    )
 
 
 # ---------------------------------------------------------------------------
