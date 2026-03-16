@@ -786,6 +786,7 @@ def handle_checkout_saga(conn, order_id, headers):
     idem_key = headers.get("Idempotency-Key") or headers.get("idempotency-key")
     correlation_id = headers.get("X-Correlation-Id") or headers.get("x-correlation-id")
 
+    print(f"Checking idempotency key {idem_key}")
     cached = check_saga_idempotency(conn, idem_key)
     if cached:
         return cached
@@ -843,6 +844,7 @@ def route_gateway_message(payload: dict, conn):
     path = payload.get("path", "/")
     body = payload.get("body") or {}
     headers = payload.get("headers") or {}
+    print(f"Got headers {headers}")
     headers["X-Correlation-Id"] = payload.get("correlation_id", "")
 
     segments = [s for s in path.strip("/").split("/") if s]
