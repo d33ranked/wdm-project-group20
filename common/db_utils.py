@@ -313,12 +313,13 @@ class HAConnectionPool:
             try:
                 new_primary = self._get_primary_host()
                 # Found a primary – rebuild the pool if it changed.
-                with self._lock:
-                    if new_primary != self._current_primary:
-                        print(f"{self.service_name}: Poller found new primary: {new_primary}")
-                        self._create_pool(retries=1, delay=0)
-                    else:
-                        print(f"{self.service_name}: Poller confirmed existing primary: {new_primary}")
+                # Do NOT hold _lock while calling _create_pool: it sleeps
+                # internally and would deadlock other greenlets waiting on _lock.
+                if new_primary != self._current_primary:
+                    print(f"{self.service_name}: Poller found new primary: {new_primary}")
+                    self._create_pool(retries=1, delay=0)
+                else:
+                    print(f"{self.service_name}: Poller confirmed existing primary: {new_primary}")
                 # Signal all waiting cursors regardless (primary may be same but
                 # connection could have been re-established).
                 self._failover_event.set()
@@ -338,23 +339,30 @@ class HAConnectionPool:
         If the pool is exhausted, yields and retries every 0.1s for up to 30s
         rather than immediately failing.
         Triggers a blocking failover if the connection probe fails.
+
+        IMPORTANT: _lock is never held across a gevent.sleep() call.  Holding
+        a threading.Lock while yielding to the gevent hub blocks every other
+        greenlet that needs the lock — causing a complete worker deadlock.
         """
-        with self._lock:
-            # Wait for a connection to become available if pool is exhausted.
-            for attempt in range(300):   # 300 x 0.1s = 30s max wait
-                try:
-                    conn = self._pool.getconn()
-                    break
-                except psycopg2.pool.PoolError:
-                    if attempt == 299:
-                        raise
-                    gevent.sleep(0.1)
+        # Wait for a connection to become available if pool is exhausted.
+        # Do NOT hold _lock here: we must be able to yield freely.
+        for attempt in range(300):   # 300 x 0.1s = 30s max wait
             try:
-                conn.cursor().execute("SELECT 1")
-                return conn
-            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-                print(f"{self.service_name}: Connection error, triggering failover: {e}")
-                self._handle_failover()
+                with self._lock:
+                    conn = self._pool.getconn()
+                break
+            except psycopg2.pool.PoolError:
+                if attempt == 299:
+                    raise
+                gevent.sleep(0.1)
+
+        try:
+            conn.cursor().execute("SELECT 1")
+            return conn
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            print(f"{self.service_name}: Connection error, triggering failover: {e}")
+            self._handle_failover()
+            with self._lock:
                 return self._pool.getconn()
 
     def cursor(self, conn) -> WrappedCursor:

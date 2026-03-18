@@ -11,7 +11,9 @@ services:
       - payment-service
 
   order-service:
-    build: ./order
+    build:
+      context: .
+      dockerfile: order/Dockerfile
     image: order:latest
     environment:
       - TRANSACTION_MODE=TPC
@@ -72,7 +74,9 @@ services:
       - etcd3
 
   stock-service:
-    build: ./stock
+    build:
+      context: .
+      dockerfile: stock/Dockerfile
     image: stock:latest
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
@@ -131,7 +135,9 @@ services:
       - etcd3
 
   payment-service:
-    build: ./payment
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
     image: payment:latest
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092

@@ -9,9 +9,10 @@ import hashlib
 import logging
 
 import psycopg2
+import psycopg2.errors
 import psycopg2.pool
 
-from db_utils import create_ha_pool
+from db_utils import create_ha_pool, retry_on_db_failure
 
 from time import perf_counter
 from flask import Flask, jsonify, abort, request, Response, g
@@ -57,7 +58,7 @@ atexit.register(close_db_connection)
 
 def get_item_from_db(item_id: str):
     # read-only item lookup operation
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute("SELECT stock, price FROM items WHERE id = %s", (item_id,))
     row = cur.fetchone()
     cur.close()
@@ -67,9 +68,10 @@ def get_item_from_db(item_id: str):
 
 
 @app.post("/item/create/<price>")
+@retry_on_db_failure(conn_pool)
 def create_item(price: int):
     key = str(uuid.uuid4())
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute(
         "INSERT INTO items (id, stock, price) VALUES (%s, %s, %s)", (key, 0, int(price))
     )
@@ -78,11 +80,12 @@ def create_item(price: int):
 
 
 @app.post("/batch_init/<n>/<starting_stock>/<item_price>")
+@retry_on_db_failure(conn_pool)
 def batch_init_users(n: int, starting_stock: int, item_price: int):
     n = int(n)
     starting_stock = int(starting_stock)
     item_price = int(item_price)
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     for i in range(n):
         cur.execute(
             "INSERT INTO items (id, stock, price) VALUES (%s, %s, %s) "
@@ -94,12 +97,14 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
 
 
 @app.get("/find/<item_id>")
+@retry_on_db_failure(conn_pool)
 def find_item(item_id: str):
     item = get_item_from_db(item_id)
     return jsonify({"stock": item["stock"], "price": item["price"]})
 
 
 @app.post("/add/<item_id>/<amount>")
+@retry_on_db_failure(conn_pool)
 def add_stock(item_id: str, amount: int):
     # check idempotency key
     cached = check_idempotency()
@@ -107,7 +112,7 @@ def add_stock(item_id: str, amount: int):
         return cached
 
     # add stock
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute("SELECT stock FROM items WHERE id = %s FOR UPDATE", (item_id,))
     row = cur.fetchone()
     if row is None:
@@ -127,6 +132,7 @@ def add_stock(item_id: str, amount: int):
 
 
 @app.post("/subtract/<item_id>/<amount>")
+@retry_on_db_failure(conn_pool)
 def remove_stock(item_id: str, amount: int):
     # check idempotency key
     cached = check_idempotency()
@@ -134,7 +140,7 @@ def remove_stock(item_id: str, amount: int):
         return cached
 
     # subtract stock
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute("SELECT stock FROM items WHERE id = %s FOR UPDATE", (item_id,))
     row = cur.fetchone()
     if row is None:
@@ -158,9 +164,10 @@ def remove_stock(item_id: str, amount: int):
 
 
 @app.post("/prepare/<txn_id>/<item_id>/<quantity>")
+@retry_on_db_failure(conn_pool)
 def prepare_transaction(txn_id: str, item_id: str, quantity: int):
     quantity = int(quantity)
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
 
     # check if the transaction is already prepared
     cur.execute(
@@ -188,17 +195,22 @@ def prepare_transaction(txn_id: str, item_id: str, quantity: int):
     cur.execute(
         "UPDATE items SET stock = stock - %s WHERE id = %s", (quantity, item_id)
     )
-    cur.execute(
-        "INSERT INTO prepared_transactions (txn_id, item_id, quantity) VALUES (%s, %s, %s)",
-        (txn_id, item_id, quantity),
-    )
+    try:
+        cur.execute(
+            "INSERT INTO prepared_transactions (txn_id, item_id, quantity) VALUES (%s, %s, %s)",
+            (txn_id, item_id, quantity),
+        )
+    except psycopg2.errors.UniqueViolation:
+        cur.close()
+        return Response("Transaction already prepared", status=200)
     cur.close()
     return Response("Transaction prepared", status=200)
 
 
 @app.post("/commit/<txn_id>")
+@retry_on_db_failure(conn_pool)
 def commit_transaction(txn_id: str):
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
 
     # remove the rollback records
     cur.execute("DELETE FROM prepared_transactions WHERE txn_id = %s", (txn_id,))
@@ -207,8 +219,9 @@ def commit_transaction(txn_id: str):
 
 
 @app.post("/abort/<txn_id>")
+@retry_on_db_failure(conn_pool)
 def abort_transaction(txn_id: str):
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
 
     # fetch (all) rollback records for this transaction
     cur.execute(
@@ -241,7 +254,7 @@ def check_idempotency():
     idem_key = request.headers.get("Idempotency-Key")
     if not idem_key:
         return None
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute("SELECT pg_advisory_xact_lock(%s)", (idempotency_token(idem_key),))
     cur.execute(
         "SELECT status_code, body FROM idempotency_keys WHERE key = %s", (idem_key,)
@@ -258,7 +271,7 @@ def save_idempotency(status_code, body):
     idem_key = request.headers.get("Idempotency-Key")
     if not idem_key:
         return
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute(
         "INSERT INTO idempotency_keys (key, status_code, body) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
         (idem_key, status_code, body),

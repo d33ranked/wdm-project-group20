@@ -11,10 +11,11 @@ import logging
 from collections import defaultdict
 
 import psycopg2
+import psycopg2.errors
 import requests
 import psycopg2.pool
 
-from db_utils import create_ha_pool
+from db_utils import create_ha_pool, retry_on_db_failure
 
 from time import perf_counter
 from flask import Flask, jsonify, abort, Response, g
@@ -64,7 +65,7 @@ atexit.register(close_db_connection)
 
 
 def get_order_from_db(order_id: str):
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute(
         "SELECT paid, items, user_id, total_cost FROM orders WHERE id = %s", (order_id,)
     )
@@ -76,9 +77,10 @@ def get_order_from_db(order_id: str):
 
 
 @app.post("/create/<user_id>")
+@retry_on_db_failure(conn_pool)
 def create_order(user_id: str):
     key = str(uuid.uuid4())
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute(
         "INSERT INTO orders (id, paid, items, user_id, total_cost) VALUES (%s, %s, %s, %s, %s)",
         (key, False, json.dumps([]), user_id, 0),
@@ -88,12 +90,13 @@ def create_order(user_id: str):
 
 
 @app.post("/batch_init/<n>/<n_items>/<n_users>/<item_price>")
+@retry_on_db_failure(conn_pool)
 def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     n = int(n)
     n_items = int(n_items)
     n_users = int(n_users)
     item_price = int(item_price)
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     for i in range(n):
         user_id = str(random.randint(0, n_users - 1))
         item1_id = str(random.randint(0, n_items - 1))
@@ -110,6 +113,7 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
 
 
 @app.get("/find/<order_id>")
+@retry_on_db_failure(conn_pool)
 def find_order(order_id: str):
     order = get_order_from_db(order_id)
     return jsonify(
@@ -123,7 +127,7 @@ def find_order(order_id: str):
     )
 
 
-def send_post_request(url: str, idempotency_key: str = None, max_retries: int = 3):
+def send_post_request(url: str, idempotency_key: str = None, max_retries: int = 4):
     headers = {}
 
     # set idempotency key in headers
@@ -134,7 +138,7 @@ def send_post_request(url: str, idempotency_key: str = None, max_retries: int = 
     start_time = perf_counter()
     for attempt in range(max_retries + 1):
         try:
-            response = requests.post(url, headers=headers, timeout=5)
+            response = requests.post(url, headers=headers, timeout=15)
             # 2xx or 4xx is valid response, don't retry
             if response.status_code < 500:
                 duration = perf_counter() - start_time
@@ -150,9 +154,9 @@ def send_post_request(url: str, idempotency_key: str = None, max_retries: int = 
             )
             if attempt == max_retries:
                 abort(400, REQ_ERROR_STR)
-        # exponential backoff
+        # fixed backoff: wait long enough for downstream DB failover to complete
         if attempt < max_retries:
-            wait = 0.1 * (2**attempt)
+            wait = 5.0
             time.sleep(wait)
     abort(400, REQ_ERROR_STR)
 
@@ -160,7 +164,7 @@ def send_post_request(url: str, idempotency_key: str = None, max_retries: int = 
 def send_get_request(url: str):
     try:
         start_time = perf_counter()
-        response = requests.get(url, timeout=5)
+        response = requests.get(url, timeout=10)
         duration = perf_counter() - start_time
         print(f"ORDER: GET request took {duration:.7f} seconds")
     except requests.exceptions.RequestException:
@@ -170,8 +174,9 @@ def send_get_request(url: str):
 
 
 @app.post("/addItem/<order_id>/<item_id>/<quantity>")
+@retry_on_db_failure(conn_pool)
 def add_item(order_id: str, item_id: str, quantity: int):
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute(
         "SELECT items, total_cost FROM orders WHERE id = %s FOR UPDATE", (order_id,)
     )
@@ -238,6 +243,7 @@ def abort_tpc(txn_id: str, prepared_stock: list, prepared_payment: bool):
 
 
 @app.post("/checkout/<order_id>")
+@retry_on_db_failure(conn_pool)
 def checkout(order_id: str):
     if TRANSACTION_MODE == "TPC":
         return checkout_tpc(order_id)
@@ -252,7 +258,7 @@ def checkout_saga(order_id: str):
     transaction_id = str(uuid.uuid4())
 
     # select and lock order
-    cur = g.conn.cursor()
+    cur = conn_pool.cursor(g.conn)
     cur.execute(
         "SELECT paid, items, user_id, total_cost FROM orders WHERE id = %s FOR UPDATE",
         (order_id,),
@@ -299,13 +305,11 @@ def checkout_saga(order_id: str):
 
 
 def checkout_tpc(order_id: str):
-    conn = g.conn
-    cur = conn.cursor()
-
     # generate transaction id
     txn_id = str(uuid.uuid4())
 
     # read and lock order row for update
+    cur = conn_pool.cursor(g.conn)
     cur.execute(
         "SELECT paid, items, user_id, total_cost FROM orders WHERE id = %s FOR UPDATE",
         (order_id,),
@@ -332,18 +336,35 @@ def checkout_tpc(order_id: str):
         abort(400, "Order has no items!")
 
     # create transaction log record for this transaction
-    cur.execute(
-        "INSERT INTO transaction_log (txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-        (txn_id, order_id, "started", json.dumps([]), False, user_id, total_cost),
-    )
-    conn.commit()
+    try:
+        cur.execute(
+            "INSERT INTO transaction_log (txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (txn_id, order_id, "started", json.dumps([]), False, user_id, total_cost),
+        )
+    except psycopg2.errors.UniqueViolation:
+        # Already inserted on a previous attempt — look up what state it reached.
+        cur.close()
+        cur = conn_pool.cursor(g.conn)
+        cur.execute(
+            "SELECT status, prepared_stock, prepared_payment FROM transaction_log WHERE txn_id = %s",
+            (txn_id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if row and row[0] in ("committed",):
+            return Response("Checkout successful", status=200)
+        if row and row[0] in ("aborted",):
+            abort(400, "Checkout already aborted")
+        # Otherwise fall through to recovery on next startup
+        abort(500, "Transaction in intermediate state, will be recovered")
+    g.conn.commit()
 
     # update transaction status = "preparing_stock" before sending PREPARE request
     cur.execute(
         "UPDATE transaction_log SET status = 'preparing_stock' WHERE txn_id = %s",
         (txn_id,),
     )
-    conn.commit()
+    g.conn.commit()
 
     # prepare stock for each item
     prepared_stock = []
@@ -353,62 +374,49 @@ def checkout_tpc(order_id: str):
             idempotency_key=f"{txn_id}:stock:prepare:{item_id}",
         )
         if reply.status_code != 200:
-            # set transaction status = "aborting"
             cur.execute(
                 "UPDATE transaction_log SET status = 'aborting' WHERE txn_id = %s",
                 (txn_id,),
             )
-            conn.commit()
-
-            # send ABORT request to all participants
+            g.conn.commit()
             abort_tpc(txn_id, prepared_stock, False)
-
-            # set transaction status = "aborted"
             cur.execute(
                 "UPDATE transaction_log SET status = 'aborted' WHERE txn_id = %s",
                 (txn_id,),
             )
-            conn.commit()
-
+            g.conn.commit()
             cur.close()
             abort(400, "Failed to PREPARE stock")
 
-        # append to prepared stock list
         prepared_stock.append([item_id, qty])
         cur.execute(
             "UPDATE transaction_log SET prepared_stock = %s WHERE txn_id = %s",
             (json.dumps(prepared_stock), txn_id),
         )
-        conn.commit()
+        g.conn.commit()
 
     # prepare payment service
     cur.execute(
         "UPDATE transaction_log SET status = 'preparing_payment' WHERE txn_id = %s",
         (txn_id,),
     )
-    conn.commit()
+    g.conn.commit()
 
     payment_reply = send_post_request(
         f"{GATEWAY_URL}/payment/prepare/{txn_id}/{user_id}/{total_cost}",
         idempotency_key=f"{txn_id}:payment:prepare",
     )
     if payment_reply.status_code != 200:
-        # set transaction status = "aborting"
         cur.execute(
             "UPDATE transaction_log SET status = 'aborting' WHERE txn_id = %s",
             (txn_id,),
         )
-        conn.commit()
-
-        # send ABORT request to all participants
+        g.conn.commit()
         abort_tpc(txn_id, prepared_stock, False)
-
-        # set transaction status = "aborted"
         cur.execute(
             "UPDATE transaction_log SET status = 'aborted' WHERE txn_id = %s", (txn_id,)
         )
-        conn.commit()
-
+        g.conn.commit()
         cur.close()
         abort(400, "Failed to PREPARE payment")
 
@@ -417,13 +425,13 @@ def checkout_tpc(order_id: str):
         "UPDATE transaction_log SET prepared_payment = TRUE WHERE txn_id = %s",
         (txn_id,),
     )
-    conn.commit()
+    g.conn.commit()
 
     # all voted YES - send COMMIT request to all participants
     cur.execute(
         "UPDATE transaction_log SET status = 'committing' WHERE txn_id = %s", (txn_id,)
     )
-    conn.commit()
+    g.conn.commit()
 
     commit_tpc(txn_id, prepared_stock, True)
 
@@ -434,7 +442,7 @@ def checkout_tpc(order_id: str):
     cur.execute(
         "UPDATE transaction_log SET status = 'committed' WHERE txn_id = %s", (txn_id,)
     )
-    conn.commit()
+    g.conn.commit()
     cur.close()
     return Response("Checkout successful", status=200)
 
