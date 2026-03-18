@@ -108,6 +108,7 @@ def handle_gateway_message(payload, conn):
             cached = check_idempotency(cur, idem_key)
             if cached:
                 conn.commit()
+                logger.warning(f"Idempotency hit on add_funds, user: {user_id}, cached result is: {cached}")
                 return cached
             cur.execute("SELECT 1 FROM users WHERE id = %s FOR UPDATE", (user_id,))
             if cur.fetchone() is None:
@@ -132,6 +133,7 @@ def handle_gateway_message(payload, conn):
             cached = check_idempotency(cur, idem_key)
             if cached:
                 conn.commit()
+                logger.warning(f"Idempotency hit on pay, user: {user_id}, cached result is: {cached}")
                 return cached
             cur.execute("SELECT credit FROM users WHERE id = %s FOR UPDATE", (user_id,))
             row = cur.fetchone()

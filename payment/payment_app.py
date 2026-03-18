@@ -24,8 +24,11 @@ import threading
 
 from common.db import create_conn_pool
 from common.kafka_helpers import build_producer, run_consumer_loop
+
 import kafka_handler
 import recovery
+
+from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -38,10 +41,26 @@ INTERNAL_KAFKA = os.environ.get("INTERNAL_KAFKA_BOOTSTRAP_SERVERS", "kafka-inter
 # Startup
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(level=logging.INFO)
+# Create logs dir and timestamped file
+os.makedirs("/logs", exist_ok=True)
+_log_filename = "payment-" + datetime.now().strftime("%y%m%d-%H%M%S") + ".log"
+_log_path = os.path.join("/logs", _log_filename)
+
+# Root config: write to both stdout and file
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),           # keeps docker compose logs -f working
+        logging.FileHandler(_log_path),    # writes to /logs/YYMMDD-HHMMSS.log
+    ]
+)
+
+# Silence noisy kafka loggers
 for _noisy in ("kafka", "kafka.conn", "kafka.client",
                "kafka.consumer", "kafka.producer"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 

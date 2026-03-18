@@ -38,6 +38,8 @@ services:
       - INTERNAL_KAFKA_BOOTSTRAP_SERVERS=kafka-internal:9092
     env_file:
       - env/order_db.env
+    volumes:
+      - ./logs/order-service:/logs
     depends_on:
       order-db:
         condition: service_healthy
@@ -72,6 +74,8 @@ services:
       - INTERNAL_KAFKA_BOOTSTRAP_SERVERS=kafka-internal:9092
     env_file:
       - env/stock_db.env
+    volumes:
+      - ./logs/stock-service:/logs
     depends_on:
       stock-db:
         condition: service_healthy
@@ -106,6 +110,8 @@ services:
       - INTERNAL_KAFKA_BOOTSTRAP_SERVERS=kafka-internal:9092
     env_file:
       - env/payment_db.env
+    volumes:
+      - ./logs/payment-service:/logs
     depends_on:
       payment-db:
         condition: service_healthy

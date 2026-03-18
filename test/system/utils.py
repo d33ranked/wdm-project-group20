@@ -31,7 +31,6 @@ def payment_pay(user_id: str, amount: int) -> int:
 
 def create_user() -> dict:
     response = requests.post(f"{PAYMENT_URL}/payment/create_user")
-    print(f"response to create user: {response.text}")
     return response.json()
 
 

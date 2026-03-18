@@ -47,8 +47,6 @@ Consistency guarantees
   - Both paths are fully idempotent by txn_id via advisory_lock.
 """
 
-from email import message
-import json
 import logging
 import uuid
 
@@ -169,6 +167,7 @@ def handle_gateway_message(payload, conn):
             cached = check_idempotency(cur, idem_key)
             if cached:
                 conn.commit()
+                logger.warning(f"Idempotency hit on add stock, item_id: {item_id}, cached result is: {cached}")
                 return cached
             cur.execute("SELECT 1 FROM items WHERE id = %s FOR UPDATE", (item_id,))
             if cur.fetchone() is None:
@@ -194,6 +193,7 @@ def handle_gateway_message(payload, conn):
             cached = check_idempotency(cur, idem_key)
             if cached:
                 conn.commit()
+                logger.warning(f"Idempotency hit on subtract stock, item_id: {item_id}, cached result is: {cached}")
                 return cached
             cur.execute("SELECT stock FROM items WHERE id = %s FOR UPDATE", (item_id,))
             row = cur.fetchone()

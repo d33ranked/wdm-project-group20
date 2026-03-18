@@ -115,6 +115,9 @@ def checkout_tpc(conn, order_id: str, original_corr_id: str,
     Returns (None, None) — response sent asynchronously when protocol completes.
     """
     with conn.cursor() as cur:
+        # If client did not provide idempotency key, use corr id
+        idem_key = original_corr_id if not idem_key else idem_key
+
         cached = check_idempotency(cur, idem_key)
         if cached:
             conn.commit()

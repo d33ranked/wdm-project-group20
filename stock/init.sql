@@ -16,5 +16,14 @@ CREATE TABLE IF NOT EXISTS prepared_transactions (
     item_id TEXT NOT NULL,
     quantity INTEGER NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (txn_id, item_id) -- a transaction can have multiple items
+    PRIMARY KEY (txn_id, item_id)
+);
+
+CREATE TABLE IF NOT EXISTS compensating_transactions (
+    txn_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (txn_id, item_id),
+    FOREIGN KEY (item_id) REFERENCES items(id)
 );
