@@ -47,7 +47,7 @@ def stock_commit(txn_id: str):
 
 def stock_abort(txn_id: str):
     return kafka_tpc("stock", {
-        "type":   "stock.abort",
+        "type":   "stock.rollback",
         "txn_id": txn_id,
     })
 
@@ -70,7 +70,7 @@ def payment_commit(txn_id: str):
 
 def payment_abort(txn_id: str):
     return kafka_tpc("payment", {
-        "type":   "payment.abort",
+        "type":   "payment.rollback",
         "txn_id": txn_id,
     })
 
@@ -390,9 +390,9 @@ def test_participant_crash_recovery():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    docker_cmd(f"docker stop {CONTAINER}")
+    docker_cmd(f"sudo docker stop {CONTAINER}")
     subprocess.Popen(
-        f"sleep 3 && docker start {CONTAINER}",
+        f"sleep 3 && sudo docker start {CONTAINER}",
         shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
