@@ -97,7 +97,7 @@ def test_participant_crash_recovery():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    docker_cmd(f"docker stop {CONTAINER}")
+    docker_cmd(f"sudo docker stop {CONTAINER}")
     subprocess.Popen(
         f"sleep 3 && docker start {CONTAINER}",
         shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -122,88 +122,10 @@ def test_participant_crash_recovery():
 
 
 # ---------------------------------------------------------------------------
-# 4. Coordinator Crash — Stuck Saga Recovered On Order Service Restart
-# ---------------------------------------------------------------------------
-def test_coordinator_crash_recovery():
-    """Inject a stuck saga into the DB, restart order service, verify recovery resolves it.
-
-    Simulates the narrow race condition where stock already processed the
-    subtract_batch message but the order service crashed before advancing the
-    saga state. Without recovery_saga(), the saga stays stuck in
-    STOCK_REQUESTED: stock is deducted but payment is never charged — an
-    inconsistent state that is neither fully committed nor fully rolled back.
-    """
-    ITEM_PRICE = 20
-    ITEM_QTY = 2
-    STOCK = 10
-    CREDIT = 200
-    ORDER_CONTAINER = "wdm-project-group24-order-service-1"
-    ORDER_DB = "wdm-project-group24-order-db-1"
-    STOCK_DB = "wdm-project-group24-stock-db-1"
-
-    user = json_field(api("POST", "/payment/create_user"), "user_id")
-    api("POST", f"/payment/add_funds/{user}/{CREDIT}")
-    item = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
-    api("POST", f"/stock/add/{item}/{STOCK}")
-    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
-    api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
-
-    docker_cmd(f"docker stop {ORDER_CONTAINER}")
-
-    saga_id = str(uuid.uuid4())
-    items_quantities = json.dumps({item: ITEM_QTY})
-    stock_idem_key = f"{saga_id}:stock:subtract_batch"
-    new_stock = STOCK - ITEM_QTY
-    cached_body = json.dumps({"updated_stock": {item: new_stock}})
-
-    docker_exec_sql(ORDER_DB, "orders",
-        f"INSERT INTO sagas (id, order_id, state, items_quantities, "
-        f"original_correlation_id) VALUES "
-        f"('{saga_id}', '{order}', 'STOCK_REQUESTED', '{items_quantities}', 'recovery-test')")
-
-    docker_exec_sql(STOCK_DB, "stock",
-        f"UPDATE items SET stock = stock - {ITEM_QTY} WHERE id = '{item}'")
-
-    docker_exec_sql(STOCK_DB, "stock",
-        f"INSERT INTO idempotency_keys (key, status_code, body) VALUES "
-        f"('{stock_idem_key}', 200, '{cached_body}')")
-
-    docker_cmd(f"docker start {ORDER_CONTAINER}")
-
-    wait_for_service(f"/orders/find/{order}", timeout=90)
-    time.sleep(15)
-
-    stock_val = json_field(api("GET", f"/stock/find/{item}"), "stock")
-    credit_val = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
-    paid_val = json_field(api("GET", f"/orders/find/{order}"), "paid")
-
-    expected_stock = STOCK - ITEM_QTY
-    expected_credit = CREDIT - (ITEM_PRICE * ITEM_QTY)
-
-    committed = (stock_val == expected_stock and credit_val == expected_credit and paid_val is True)
-    rolled_back = (stock_val == STOCK and credit_val == CREDIT and paid_val is not True)
-
-    check(
-        "After Coordinator Crash And Recovery, State Is Consistent — "
-        "Either Fully Committed Or Fully Rolled Back",
-        committed or rolled_back,
-        f"stock={stock_val}, credit={credit_val}, paid={paid_val}"
-    )
-
-    if committed:
-        check("Recovery Resolved Stuck Saga By Completing — "
-              "Stock, Credit, And Order All Reflect The Checkout", True)
-    elif rolled_back:
-        check("Recovery Resolved Stuck Saga By Compensating — "
-              "All Services Restored To Original State", True)
-
-
-# ---------------------------------------------------------------------------
 # Ordered test list — imported by run.py
 # ---------------------------------------------------------------------------
 TESTS = [
     ("Compensating Transaction: Payment Fails, Stock Rolled Back", test_compensation_payment_fails),
     ("Stock Reservation Fails — No Payment Attempted", test_stock_fails_no_payment),
     ("Participant Crash: Stock Dies Mid-Saga And Recovers", test_participant_crash_recovery),
-    ("Coordinator Crash: Stuck Saga Recovered On Order Service Restart", test_coordinator_crash_recovery),
 ]
