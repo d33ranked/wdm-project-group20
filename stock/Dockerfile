@@ -6,9 +6,11 @@ COPY stock/requirements.txt .
 
 RUN pip install -r requirements.txt
 
+COPY common/ ./common/
 COPY stock/ .
-COPY common/db_utils.py .
 
 EXPOSE 5000
 
 ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "stock_app.py"]

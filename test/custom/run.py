@@ -9,8 +9,14 @@ Single entry point for all custom tests.
 - Tears down, rebuilds, and starts all containers
 - Waits for services to become healthy
 - Runs the appropriate test modules; user presses Enter between test cases
+
+Optional arguments:
+  --skip-common         Skip the common test suite, only run mode-specific tests
+  --only N [N ...]      Only run the listed test case numbers (1-based) from the
+                        mode-specific suite  (e.g. --only 1 3 5)
 """
 
+import argparse
 import importlib
 import os
 import re
@@ -40,6 +46,41 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 # ---------------------------------------------------------------------------
 # Shared test harness — imported by test_common, test_tpc, test_sagas
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Docker helpers (shared by test_tpc and test_sagas)
+# ---------------------------------------------------------------------------
+
+def docker_cmd(cmd: str):
+    """Run a docker command silently."""
+    subprocess.run(
+        cmd, shell=True, cwd=PROJECT_ROOT,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def docker_exec_sql(container: str, db: str, sql: str):
+    """Execute a SQL statement inside a postgres container."""
+    subprocess.run(
+        ["sudo", "docker", "exec", container, "psql", "-U", "user", "-d", db, "-c", sql],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def wait_for_service(probe_path: str, timeout: int = 60):
+    """Poll until a service endpoint responds with a non-5xx status."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            r = requests.get(f"{BASE_URL}{probe_path}", timeout=3)
+            if r.status_code < 500:
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+
 _pass_count = 0
 _fail_count = 0
 
@@ -103,12 +144,13 @@ def _run(cmd: str, cwd: str = PROJECT_ROOT, check_rc: bool = True):
 
 
 def set_transaction_mode(mode: str):
-    """Patch TRANSACTION_MODE in docker-compose.yml."""
+    """Patch TRANSACTION_MODE and nginx config in docker-compose.yml."""
     with open(COMPOSE_FILE, "r") as f:
         content = f.read()
+    # Update TRANSACTION_MODE env var across all services
     updated = re.sub(
         r"(TRANSACTION_MODE=)\w+",
-        rf"\g<1>{mode}",
+        rf"\g<1>{mode.upper()}",
         content,
     )
     with open(COMPOSE_FILE, "w") as f:
@@ -122,9 +164,9 @@ def docker_clean_and_start():
     print("\n" + sep)
     print("  Docker Compose Clean & Start")
     print(sep)
-    _run("docker compose down -v --remove-orphans")
-    _run("docker compose build --quiet")
-    _run("docker compose up -d")
+    _run("sudo docker compose down -v --remove-orphans")
+    _run("sudo docker compose build --quiet")
+    _run("sudo docker compose up -d")
     print()
 
 
@@ -134,18 +176,19 @@ def wait_for_services(timeout: int = 90):
     endpoints = [
         "/stock/item/create/1",
         "/payment/create_user",
+        "/orders/create/healthcheck",
     ]
     start = time.time()
     while time.time() - start < timeout:
         try:
             ok = all(
-                requests.post(f"{BASE_URL}{ep}", timeout=5).status_code == 200
+                requests.post(f"{BASE_URL}{ep}", timeout=5).status_code < 300
                 for ep in endpoints
             )
             if ok:
                 print("  All Services Are Up.\n")
                 return
-        except requests.ConnectionError:
+        except requests.RequestException:
             pass
         time.sleep(3)
     print("  Timed Out Waiting for Services.")
@@ -172,8 +215,15 @@ def collect_tests(module_name: str):
     return getattr(mod, "TESTS", [])
 
 
-def run_suite(label: str, tests: list):
-    """Run a list of (name, func) test pairs; user presses Enter between them."""
+def run_suite(label: str, tests: list, only: list[int] | None = None):
+    """Run a list of (name, func) test pairs; user presses Enter between them.
+
+    Args:
+        label:  Display label for this suite.
+        tests:  Full list of (name, func) pairs.
+        only:   1-based indices of tests to run. None means run all.
+    """
+    global _fail_count
     if not tests:
         sep = "=" * LINE_WIDTH
         print(f"\n{sep}")
@@ -181,27 +231,42 @@ def run_suite(label: str, tests: list):
         print(sep)
         return 0, 0
 
+    # Apply --only filter if provided
+    if only:
+        invalid = [n for n in only if n < 1 or n > len(tests)]
+        if invalid:
+            print(
+                f"  \033[91m[ERROR]\033[0m --only contains out-of-range numbers: "
+                f"{invalid}  (suite has {len(tests)} tests)"
+            )
+            sys.exit(1)
+        # Keep original 1-based index alongside each test for display
+        selected = [(n, tests[n - 1]) for n in sorted(only)]
+    else:
+        selected = [(n, t) for n, t in enumerate(tests, start=1)]
+
     sep = "=" * LINE_WIDTH
     dash = "-" * LINE_WIDTH
+    skipped = len(tests) - len(selected)
+    skip_note = f", skipping {skipped}" if skipped else ""
     print(f"\n{sep}")
-    print(f"  {label}  ({len(tests)} Test Cases)")
+    print(f"  {label}  ({len(selected)}/{len(tests)} Test Cases{skip_note})")
     print(sep)
 
     case_pass = 0
     case_fail = 0
 
-    for idx, (name, func) in enumerate(tests):
-        if idx > 0:
+    for run_idx, (original_num, (name, func)) in enumerate(selected):
+        if run_idx > 0:
             wait_for_enter()
 
         reset_counts()
-        print(f"\n  [{idx + 1}/{len(tests)}] {name}")
+        print(f"\n  [{original_num}/{len(tests)}] {name}")
         print(dash)
         try:
             func()
         except Exception as e:
             print(f"    \033[91m[ERROR]\033[0m {e}")
-            global _fail_count
             _fail_count += 1
 
         _, f = get_counts()
@@ -213,11 +278,40 @@ def run_suite(label: str, tests: list):
     return case_pass, case_fail
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Benchmarking suite runner — Group 20",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python run.py                        # run everything\n"
+            "  python run.py --skip-common          # skip common tests\n"
+            "  python run.py --only 2 4             # only suite tests 2 and 4\n"
+            "  python run.py --skip-common --only 1 3 5\n"
+        ),
+    )
+    parser.add_argument(
+        "--skip-common",
+        action="store_true",
+        help="Skip the common test suite and only run the mode-specific suite.",
+    )
+    parser.add_argument(
+        "--only",
+        metavar="N",
+        nargs="+",
+        type=int,
+        help="Only run these test case numbers (1-based) from the mode-specific suite.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
     sep = "=" * LINE_WIDTH
     print()
     print(sep)
-    print("  Group 20 Test Suite")
+    print("  BENCHMARKING SUITE — GROUP 20")
     print(sep)
 
     # --- Ask for mode ---
@@ -242,14 +336,16 @@ def main():
     # --- Run ---
     total_pass, total_fail = 0, 0
 
-    p, f = run_suite("Common Test Suite", common_tests)
-    total_pass += p
-    total_fail += f
+    if not args.skip_common:
+        p, f = run_suite("Common Test Suite", common_tests)
+        total_pass += p
+        total_fail += f
+        if common_tests and mode_tests:
+            wait_for_enter()
+    else:
+        print(f"\n  [--skip-common] Skipping Common Test Suite.")
 
-    if common_tests and mode_tests:
-        wait_for_enter()
-
-    p, f = run_suite(f"{mode_label} Test Suite", mode_tests)
+    p, f = run_suite(f"{mode_label} Test Suite", mode_tests, only=args.only)
     total_pass += p
     total_fail += f
 
@@ -260,6 +356,10 @@ def main():
     print(f"  Final Summary")
     print(sep)
     print(f"    Mode:        {mode}")
+    if args.skip_common:
+        print(f"    Common:      skipped")
+    if args.only:
+        print(f"    Only:        {args.only}")
     print(f"    Test cases:  {total_cases}")
     print(f"    Passed:      \033[92m{total_pass}\033[0m")
     print(f"    Failed:      \033[91m{total_fail}\033[0m")

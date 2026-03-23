@@ -30,7 +30,8 @@ def payment_pay(user_id: str, amount: int) -> int:
 
 
 def create_user() -> dict:
-    return requests.post(f"{PAYMENT_URL}/payment/create_user").json()
+    response = requests.post(f"{PAYMENT_URL}/payment/create_user")
+    return response.json()
 
 
 def find_user(user_id: str) -> dict:

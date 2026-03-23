@@ -5,73 +5,13 @@ Tests specific to the TPC transaction mode.
 Covers prepare/commit/abort correctness, resource locking during prepare,
 competing transactions, idempotent commit/abort, mixed-vote checkout scenarios,
 and coordinator/participant failure recovery.
-
-Internal 2PC operations (prepare/commit/abort) are sent directly over the
-internal Kafka broker via kafka_tpc().  All other calls (create, add, find,
-checkout) remain HTTP requests through the gateway.
 """
 
 import subprocess
+import threading
+import time
 
-from run import api, check, json_field, docker_cmd, wait_for_service
-from kafka_test_helpers import kafka_tpc, wait_for_kafka
-
-# ---------------------------------------------------------------------------
-# Wait for internal Kafka broker — runs once when the module is first imported
-# ---------------------------------------------------------------------------
-wait_for_kafka()
-
-
-# ---------------------------------------------------------------------------
-# Kafka 2PC helpers
-# ---------------------------------------------------------------------------
-
-def stock_prepare(txn_id: str, item_id: str, quantity: int):
-    return kafka_tpc("stock", {
-        "type":     "stock.prepare",
-        "txn_id":   txn_id,
-        "items": [{
-            "item_id":  item_id,
-            "quantity": quantity,
-        }]
-    })
-
-
-def stock_commit(txn_id: str):
-    return kafka_tpc("stock", {
-        "type":   "stock.commit",
-        "txn_id": txn_id,
-    })
-
-
-def stock_abort(txn_id: str):
-    return kafka_tpc("stock", {
-        "type":   "stock.rollback",
-        "txn_id": txn_id,
-    })
-
-
-def payment_prepare(txn_id: str, user_id: str, amount: int):
-    return kafka_tpc("payment", {
-        "type":    "payment.prepare",
-        "txn_id":  txn_id,
-        "user_id": user_id,
-        "amount":  amount,
-    })
-
-
-def payment_commit(txn_id: str):
-    return kafka_tpc("payment", {
-        "type":   "payment.commit",
-        "txn_id": txn_id,
-    })
-
-
-def payment_abort(txn_id: str):
-    return kafka_tpc("payment", {
-        "type":   "payment.rollback",
-        "txn_id": txn_id,
-    })
+from run import api, check, json_field, PROJECT_ROOT, docker_cmd, docker_exec_sql, wait_for_service
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +22,7 @@ def test_prepare_commit():
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/10")
 
-    r = stock_prepare("txn-pc-s", item, 3)
+    r = api("POST", f"/stock/prepare/txn-pc-s/{item}/3")
     check("Stock PREPARE Reserves 3 Of 10 Units — Service Votes YES",
           r.status_code == 200)
 
@@ -90,7 +30,7 @@ def test_prepare_commit():
     check("Stock Shows 7 After PREPARE — 3 Units Held In Reservation",
           stock == 7, f"got {stock}")
 
-    r = stock_commit("txn-pc-s")
+    r = api("POST", "/stock/commit/txn-pc-s")
     check("Stock COMMIT Finalises The Transaction",
           r.status_code == 200)
 
@@ -101,7 +41,7 @@ def test_prepare_commit():
     user = json_field(api("POST", "/payment/create_user"), "user_id")
     api("POST", f"/payment/add_funds/{user}/100")
 
-    r = payment_prepare("txn-pc-p", user, 30)
+    r = api("POST", f"/payment/prepare/txn-pc-p/{user}/30")
     check("Payment PREPARE Reserves 30 Of 100 Credits — Service Votes YES",
           r.status_code == 200)
 
@@ -109,7 +49,7 @@ def test_prepare_commit():
     check("Credit Shows 70 After PREPARE — 30 Credits Held In Reservation",
           credit == 70, f"got {credit}")
 
-    r = payment_commit("txn-pc-p")
+    r = api("POST", "/payment/commit/txn-pc-p")
     check("Payment COMMIT Finalises The Transaction",
           r.status_code == 200)
 
@@ -126,12 +66,12 @@ def test_prepare_abort():
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/10")
 
-    stock_prepare("txn-pa-s", item, 4)
+    api("POST", f"/stock/prepare/txn-pa-s/{item}/4")
     stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
     check("Stock Shows 6 After PREPARE Reserved 4 Units",
           stock == 6, f"got {stock}")
 
-    r = stock_abort("txn-pa-s")
+    r = api("POST", "/stock/abort/txn-pa-s")
     check("Stock ABORT Releases The Reservation", r.status_code == 200)
 
     stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
@@ -141,12 +81,12 @@ def test_prepare_abort():
     user = json_field(api("POST", "/payment/create_user"), "user_id")
     api("POST", f"/payment/add_funds/{user}/100")
 
-    payment_prepare("txn-pa-p", user, 40)
+    api("POST", f"/payment/prepare/txn-pa-p/{user}/40")
     credit = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
     check("Credit Shows 60 After PREPARE Reserved 40 Credits",
           credit == 60, f"got {credit}")
 
-    r = payment_abort("txn-pa-p")
+    r = api("POST", "/payment/abort/txn-pa-p")
     check("Payment ABORT Releases The Reservation", r.status_code == 200)
 
     credit = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
@@ -162,7 +102,7 @@ def test_vote_no():
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/2")
 
-    r = stock_prepare("txn-vno-s", item, 999)
+    r = api("POST", f"/stock/prepare/txn-vno-s/{item}/999")
     check("Stock PREPARE For 999 Units Rejected — Only 2 Available, Service Votes NO",
           400 <= r.status_code < 500)
 
@@ -173,7 +113,7 @@ def test_vote_no():
     user = json_field(api("POST", "/payment/create_user"), "user_id")
     api("POST", f"/payment/add_funds/{user}/10")
 
-    r = payment_prepare("txn-vno-p", user, 999)
+    r = api("POST", f"/payment/prepare/txn-vno-p/{user}/999")
     check("Payment PREPARE For 999 Credits Rejected — Only 10 Available, Service Votes NO",
           400 <= r.status_code < 500)
 
@@ -190,7 +130,7 @@ def test_prepare_locks_resources():
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/10")
 
-    stock_prepare("txn-lock", item, 8)
+    api("POST", f"/stock/prepare/txn-lock/{item}/8")
     stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
     check("Stock Shows 2 After PREPARE Locked 8 Of 10 Units",
           stock == 2, f"got {stock}")
@@ -203,7 +143,7 @@ def test_prepare_locks_resources():
     check("Stock Still Shows 2 — Failed Subtract Did Not Corrupt Reserved State",
           stock == 2, f"got {stock}")
 
-    stock_abort("txn-lock")
+    api("POST", "/stock/abort/txn-lock")
 
 
 # ---------------------------------------------------------------------------
@@ -214,8 +154,8 @@ def test_abort_frees_resources():
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/10")
 
-    stock_prepare("txn-free", item, 8)
-    stock_abort("txn-free")
+    api("POST", f"/stock/prepare/txn-free/{item}/8")
+    api("POST", "/stock/abort/txn-free")
 
     stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
     check("Stock Restored To 10 After ABORT Released 8 Reserved Units",
@@ -238,11 +178,11 @@ def test_competing_prepares():
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/10")
 
-    r1 = stock_prepare("txn-comp-a", item, 7)
+    r1 = api("POST", f"/stock/prepare/txn-comp-a/{item}/7")
     check("First PREPARE Reserves 7 Of 10 — Votes YES",
           r1.status_code == 200)
 
-    r2 = stock_prepare("txn-comp-b", item, 7)
+    r2 = api("POST", f"/stock/prepare/txn-comp-b/{item}/7")
     check("Second PREPARE For 7 Votes NO — Only 3 Unreserved, Cannot Fulfil",
           400 <= r2.status_code < 500)
 
@@ -250,7 +190,7 @@ def test_competing_prepares():
     check("Stock Shows 3 — Only First Reservation Held, Second Was Rejected",
           stock == 3, f"got {stock}")
 
-    stock_abort("txn-comp-a")
+    api("POST", "/stock/abort/txn-comp-a")
 
 
 # ---------------------------------------------------------------------------
@@ -260,10 +200,10 @@ def test_idempotent_commit():
     """COMMIT same txn twice — second is a no-op, no double deduction."""
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/10")
-    stock_prepare("txn-idem-c", item, 3)
-    stock_commit("txn-idem-c")
+    api("POST", f"/stock/prepare/txn-idem-c/{item}/3")
+    api("POST", "/stock/commit/txn-idem-c")
 
-    r = stock_commit("txn-idem-c")
+    r = api("POST", "/stock/commit/txn-idem-c")
     check("Stock: Second COMMIT On Same Transaction Returns 200 — Idempotent",
           r.status_code == 200)
 
@@ -273,10 +213,10 @@ def test_idempotent_commit():
 
     user = json_field(api("POST", "/payment/create_user"), "user_id")
     api("POST", f"/payment/add_funds/{user}/100")
-    payment_prepare("txn-idem-cp", user, 20)
-    payment_commit("txn-idem-cp")
+    api("POST", f"/payment/prepare/txn-idem-cp/{user}/20")
+    api("POST", "/payment/commit/txn-idem-cp")
 
-    r = payment_commit("txn-idem-cp")
+    r = api("POST", "/payment/commit/txn-idem-cp")
     check("Payment: Second COMMIT Returns 200 — No Double Charge",
           r.status_code == 200)
 
@@ -290,20 +230,20 @@ def test_idempotent_commit():
 # ---------------------------------------------------------------------------
 def test_abort_safety():
     """ABORT on unknown txn and already-committed txn — both return 200, no state change."""
-    r = stock_abort("txn-never-existed")
+    r = api("POST", "/stock/abort/txn-never-existed")
     check("Stock: ABORT Of Non-Existent Transaction Returns 200 — Safe No-Op",
           r.status_code == 200)
 
-    r = payment_abort("txn-never-existed")
+    r = api("POST", "/payment/abort/txn-never-existed")
     check("Payment: ABORT Of Non-Existent Transaction Returns 200 — Safe No-Op",
           r.status_code == 200)
 
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/5")
-    stock_prepare("txn-already", item, 2)
-    stock_commit("txn-already")
+    api("POST", f"/stock/prepare/txn-already/{item}/2")
+    api("POST", "/stock/commit/txn-already")
 
-    r = stock_abort("txn-already")
+    r = api("POST", "/stock/abort/txn-already")
     check("Stock: ABORT Of Already-Committed Transaction Returns 200 — Does Not Reverse The Commit",
           r.status_code == 200)
 
@@ -389,9 +329,9 @@ def test_participant_crash_recovery():
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    docker_cmd(f"sudo docker stop {CONTAINER}")
+    docker_cmd(f"docker stop {CONTAINER}")
     subprocess.Popen(
-        f"sleep 3 && sudo docker start {CONTAINER}",
+        f"sleep 3 && docker start {CONTAINER}",
         shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
@@ -430,38 +370,9 @@ def test_coordinator_crash_recovery():
     ITEM_QTY = 2
     STOCK = 10
     CREDIT = 200
-
-    # Resolve container names at runtime — docker auto-names containers as
-    # <project>-<service>-<index> where project = folder name or
-    # COMPOSE_PROJECT_NAME.  Hardcoding it breaks when the folder differs.
-    def _find_container(service: str) -> str:
-        result = subprocess.run(
-            ["sudo", "docker", "ps", "--filter", f"name={service}", "--format", "{{.Names}}"],
-            capture_output=True, text=True,
-        )
-        names = [n.strip() for n in result.stdout.strip().splitlines() if n.strip()]
-        if not names:
-            raise RuntimeError(f"No running container found matching name '{service}'")
-        # Prefer exact suffix match over partial hits
-        exact = [n for n in names if n.endswith(f"-{service}-1") or n == service]
-        return (exact or names)[0]
-
-    def _exec_sql_checked(container: str, db: str, sql: str):
-        """Run SQL and raise if psql exits non-zero."""
-        result = subprocess.run(
-            ["sudo", "docker", "exec", container, "psql", "-U", "user", "-d", db, "-c", sql],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"SQL injection failed on {container}/{db}:\n"
-                f"  SQL: {sql}\n"
-                f"  stderr: {result.stderr.strip()}"
-            )
-
-    ORDER_CONTAINER = _find_container("order-service")
-    ORDER_DB_CONTAINER = _find_container("order-db")
-    STOCK_DB_CONTAINER = _find_container("stock-db")
+    ORDER_CONTAINER = "wdm-project-group24-order-service-1"
+    ORDER_DB = "wdm-project-group24-order-db-1"
+    STOCK_DB = "wdm-project-group24-stock-db-1"
 
     # 1. Create resources via API
     user = json_field(api("POST", "/payment/create_user"), "user_id")
@@ -472,36 +383,32 @@ def test_coordinator_crash_recovery():
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
     txn_id = f"recovery-test-{uuid.uuid4()}"
-    items_json = json.dumps([{"item_id": item, "quantity": ITEM_QTY}])
+    prepared_stock = json.dumps([{"item_id": item, "quantity": ITEM_QTY}])
 
-    # 2. Inject stuck state — simulates coordinator crashed after both
-    #    stock.prepare and payment.prepare were sent (status=PREPARING) but
-    #    before either vote was received.
-    #
-    #    Stock: deduct units and write prepared_transactions undo-log entry,
-    #    exactly as _tpc_prepare() does.
-    _exec_sql_checked(
-        STOCK_DB_CONTAINER, "stock",
+    # 2. Inject stuck state directly into DBs — simulates coordinator crashed
+    #    after stock PREPARE succeeded but before payment PREPARE was sent.
+    #    Stock: deduct units and record prepared_transaction (as PREPARE does).
+    docker_exec_sql(
+        STOCK_DB, "stock",
         f"UPDATE items SET stock = stock - {ITEM_QTY} WHERE id = '{item}';"
     )
-    _exec_sql_checked(
-        STOCK_DB_CONTAINER, "stock",
+    docker_exec_sql(
+        STOCK_DB, "stock",
         f"INSERT INTO prepared_transactions (txn_id, item_id, quantity) "
         f"VALUES ('{txn_id}', '{item}', {ITEM_QTY});"
     )
-    #    Order: insert a transaction_log row stuck in PREPARING with no votes.
-    #    original_correlation_id is NOT NULL so we supply a placeholder.
-    _exec_sql_checked(
-        ORDER_DB_CONTAINER, "orders",
+    #    Order: insert a transaction_log row stuck in 'preparing_payment'.
+    docker_exec_sql(
+        ORDER_DB, "orders",
         f"INSERT INTO transaction_log "
-        f"(txn_id, order_id, status, items, user_id, total_cost, original_correlation_id, stock_vote, payment_vote) "
-        f"VALUES ('{txn_id}', '{order}', 'ABORTING', "
-        f"'{items_json}'::jsonb, '{user}', {ITEM_PRICE * ITEM_QTY}, 'injected', 'YES', 'NO');"
+        f"(txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) "
+        f"VALUES ('{txn_id}', '{order}', 'preparing_payment', "
+        f"'{prepared_stock}', FALSE, '{user}', {ITEM_PRICE * ITEM_QTY});"
     )
 
     check(
         "Stuck Transaction Injected Into DB — "
-        f"txn={txn_id[:8]}... status=PREPARING, stock reduced by {ITEM_QTY}",
+        f"txn={txn_id[:8]}... status=preparing_payment, stock reduced by {ITEM_QTY}",
         True,
     )
 
@@ -512,13 +419,14 @@ def test_coordinator_crash_recovery():
         f"got {stock_before}",
     )
 
-    # 3. Restart the order service — recovery runs on startup.
-    docker_cmd(f"sudo docker restart {ORDER_CONTAINER}")
+    # 3. Restart the order service — recovery_tpc runs on startup.
+    docker_cmd(f"docker restart {ORDER_CONTAINER}")
     wait_for_service(f"/orders/find/{order}", timeout=90)
+    time.sleep(3)
 
     # 4. Verify recovery resolved the stuck transaction.
-    #    status=PREPARING with no votes → recovery aborts both sides →
-    #    stock returned, credit untouched, order NOT paid.
+    #    status='preparing_payment' → recovery aborts (stock not committed yet,
+    #    payment never started) → stock returned, order NOT paid.
     stock_after = json_field(api("GET", f"/stock/find/{item}"), "stock")
     credit_after = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
     paid_after = json_field(api("GET", f"/orders/find/{order}"), "paid")
