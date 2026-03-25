@@ -19,7 +19,7 @@ REQUEST_TIMEOUT_S = int(os.environ.get("REQUEST_TIMEOUT_MS", "30000")) / 1000
 GATEWAY_TOPICS = ["gateway.orders", "gateway.stock", "gateway.payment"]
 RESPONSE_TOPIC = "gateway.responses"
 
-_STRIP_HEADERS = {"host", "connection", "transfer-encoding", "content-length"}
+_STRIP_HEADERS = {"host", "connection", "transfer-encoding", "content-length", "X-idempotency-key", "idempotency-key"}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

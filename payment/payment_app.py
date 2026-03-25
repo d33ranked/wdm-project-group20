@@ -1,46 +1,18 @@
-"""
-Payment service — pure Kafka consumer process.
-
-Three consumer loops run as threads:
-
-  gateway-consumer      — HTTP-proxy requests from the api-gateway
-                          (create_user, batch_init, find_user, add_funds, pay)
-  tpc-consumer          — 2PC commands from the order service
-                          (payment.prepare / payment.commit / payment.rollback)
-  saga-consumer         — SAGA commands from the order service
-                          (payment.execute / payment.rollback)
-
-A background recovery thread periodically rolls back stale prepared
-transactions (2PC only) to ensure eventual consistency after coordinator
-crashes.  SAGA transactions have no stale state — silence means success.
-"""
-
+import asyncio
 import logging
 import os
-import threading
-
-from common.db import create_conn_pool
-from common.kafka_helpers import build_producer, run_consumer_loop
-
-import kafka_handler
-import recovery
 
 from datetime import datetime
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+from orchastrator import Orchestrator, Task, TaskResult
+from common.db import create_conn_pool
 
-GATEWAY_KAFKA  = os.environ.get("KAFKA_BOOTSTRAP_SERVERS",          "kafka-external:9092")
-INTERNAL_KAFKA = os.environ.get("INTERNAL_KAFKA_BOOTSTRAP_SERVERS", "kafka-internal:9092")
-
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
+import handlers
+from recovery import run_recovery_loop, run_stale_recovery_once
 
 # Create logs dir and timestamped file
 os.makedirs("/logs", exist_ok=True)
-_log_filename = "payment-" + datetime.now().strftime("%y%m%d-%H%M%S") + ".log"
+_log_filename = "order-" + datetime.now().strftime("%y%m%d-%H%M%S") + ".log"
 _log_path = os.path.join("/logs", _log_filename)
 
 # Root config: write to both stdout and file
@@ -54,66 +26,79 @@ logging.basicConfig(
 )
 
 # Silence noisy kafka loggers
-for _noisy in ("kafka", "kafka.conn", "kafka.client",
-               "kafka.consumer", "kafka.producer"):
+for _noisy in ("kafka", "kafka.conn", "kafka.client", "kafka.consumer", "kafka.producer"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
 
 
-def _start_consumer(conn_pool, bootstrap, topic, group_id, producer, response_topic, handler, name):
-    """Convenience wrapper — starts a run_consumer_loop daemon thread."""
-    threading.Thread(
-        target=run_consumer_loop,
-        args=(conn_pool, bootstrap, topic, group_id, producer, response_topic, handler, name),
-        daemon=True,
-        name=name,
-    ).start()
 
+# --- Configuration ---
+KAFKA_SERVER = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "/data/checkpoints")
 
-def main():
-    conn_pool = create_conn_pool("PAYMENT")
+# Initialize Orchestrator
+orch = Orchestrator(
+    consumer_config={"bootstrap.servers": KAFKA_SERVER, "group.id": "payment-service"},
+    producer_config={"bootstrap.servers": KAFKA_SERVER},
+    checkpoint_dir=CHECKPOINT_DIR,
+    dlq_topic="payment.dlq",
+    max_concurrency=50
+)
 
-    gateway_producer  = build_producer(GATEWAY_KAFKA)
-    internal_producer = build_producer(INTERNAL_KAFKA)
+# Shared Resources
+db_pool = create_conn_pool("PAYMENT")
 
-    # Gateway — HTTP-proxy requests from the api-gateway
-    _start_consumer(
-        conn_pool, GATEWAY_KAFKA,
-        "gateway.payment", "payment-service-gateway",
-        gateway_producer, "gateway.responses",
-        kafka_handler.handle_gateway_message, "Payment-Gateway",
+# --- Handlers ---
+
+@orch.handler("gateway.payment")
+async def handle_gateway(task: Task) -> TaskResult:
+    """Handles HTTP-proxy requests from the Gateway."""
+    # We wrap blocking DB calls in a thread to avoid freezing the orchestrator
+    loop = asyncio.get_event_loop()
+    status_code, body = await loop.run_in_executor(
+        None, handlers.handle_gateway_logic, task.value, db_pool, task.key
     )
+    
+    # Gateway expects correlation_id in the body
+    if isinstance(body, dict):
+        body["correlation_id"] = task.key
+        
+    return TaskResult.ok(output_topic="gateway.responses", output_value=body)
 
-    # 2PC — pessimistic coordination (prepare / commit / rollback)
-    _start_consumer(
-        conn_pool, INTERNAL_KAFKA,
-        "internal.payment.tpc", "payment-service-tpc",
-        internal_producer, "internal.responses",
-        kafka_handler.handle_tpc_message, "Payment-TPC",
+@orch.handler("internal.payment.tpc")
+async def handle_tpc(task: Task) -> TaskResult:
+    """Handles 2PC (Prepare/Commit/Rollback)."""
+    loop = asyncio.get_event_loop()
+    result_payload = await loop.run_in_executor(
+        None, handlers.handle_tpc_logic, task.value, db_pool
     )
+    return TaskResult.ok(output_topic="internal.responses", output_value=result_payload)
 
-    # SAGA — optimistic coordination (execute / rollback, silence = success)
-    _start_consumer(
-        conn_pool, INTERNAL_KAFKA,
-        "internal.payment.saga", "payment-service-saga",
-        internal_producer, "internal.responses",
-        kafka_handler.handle_saga_message, "Payment-SAGA",
+@orch.handler("internal.payment.saga")
+async def handle_saga(task: Task) -> TaskResult:
+    """Handles SAGA (Execute/Rollback)."""
+    loop = asyncio.get_event_loop()
+    result_payload = await loop.run_in_executor(
+        None, handlers.handle_saga_logic, task.value, db_pool
     )
+    return TaskResult.ok(output_topic="internal.responses", output_value=result_payload)
 
-    # Recovery — periodically rolls back stale 2PC prepared transactions
-    threading.Thread(
-        target=recovery.run_recovery_loop,
-        args=(conn_pool, internal_producer),
-        daemon=True,
-        name="recovery",
-    ).start()
+@orch.handler("payment.dlq")
+async def handle_dfq(task: Task) -> None:
+    logger.warning(f"Received msg in dlq: {task}, dict format: {task.to_checkpoint()}")
 
-    logger.info("Payment service started")
+async def main():
+    # Run recovery once, on startup and await it before continuing setting up
+    await run_stale_recovery_once(db_pool, orch)
 
-    # Block main thread — daemon threads exit when this returns
-    threading.Event().wait()
-
+    # Start the recovery background task (2PC cleanup)
+    asyncio.create_task(run_recovery_loop(db_pool, orch))
+    
+    logger.info("Payment service starting Orchestrator loop...")
+    await orch.run()
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
