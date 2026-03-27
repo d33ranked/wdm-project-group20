@@ -1,29 +1,5 @@
-"""
-Phase 2 — Redis Streams Tests
-==============================
-SAGA-mode-only tests that specifically exercise behaviours introduced by
-the Kafka → Redis Streams migration.
-
-What these tests validate
---------------------------
-1. Double-checkout prevention — a second checkout on an in-flight or already-
-   completed order is rejected cleanly; the stream consumer handles the
-   duplicate without corrupting state.
-
-2. Multi-item compensation — when payment fails after stock has already been
-   reserved for several items, the compensating transaction restores ALL items,
-   not just the first one.
-
-3. Concurrent correlation isolation — 20 checkouts fire simultaneously through
-   the gateway stream; each request's correlation_id is matched to the correct
-   response, and no response leaks into the wrong caller.
-
-4. Pending-message re-delivery after participant crash — the stock service is
-   stopped while a checkout is in-flight; after restart the pending Redis
-   Stream message is re-delivered (via XREADGROUP id="0") and the saga
-   completes successfully.  This is the stream-level equivalent of the old
-   Kafka offset persistence test.
-"""
+# phase 2 stream tests — validates double-checkout prevention, multi-item compensation,
+# concurrent correlation isolation, and pending-message re-delivery after participant crash
 
 import concurrent.futures
 import time

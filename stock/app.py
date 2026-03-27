@@ -16,7 +16,7 @@ from common.redis_db import (
     setup_gunicorn_logging,
     LuaScripts,
 )
-from common.idempotency import check_idempotency_http, save_idempotency_http
+from common.idempotency import check_idempotency, save_idempotency
 from common.streams import create_bus_pool
 
 TRANSACTION_MODE = os.environ.get("TRANSACTION_MODE", "TPC")
@@ -33,11 +33,6 @@ bus_pool = create_bus_pool()
 _scripts = LuaScripts(redis_lib.Redis(connection_pool=redis_pool))
 
 
-# ---------------------------------------------------------------------------
-# Flask Endpoints
-# ---------------------------------------------------------------------------
-
-
 @app.post("/item/create/<price>")
 def create_item(price: int):
     key = str(uuid.uuid4())
@@ -51,7 +46,10 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
     # batch all hset commands in a single round-trip
     pipe = g.redis.pipeline(transaction=False)
     for i in range(n):
-        pipe.hset(f"item:{i}", mapping={"stock": str(starting_stock), "price": str(item_price)})
+        pipe.hset(
+            f"item:{i}",
+            mapping={"stock": str(starting_stock), "price": str(item_price)},
+        )
     pipe.execute()
     return jsonify({"msg": "Batch init for stock successful"})
 
@@ -69,7 +67,7 @@ def add_stock(item_id: str, amount: int):
     if int(amount) <= 0:
         abort(400, "Amount must be positive!")
     idem_key = request.headers.get("Idempotency-Key")
-    cached = check_idempotency_http(g.redis, idem_key)
+    cached = check_idempotency(g.redis, idem_key)
     if cached is not None:
         return Response(cached[1], status=cached[0])
 
@@ -80,7 +78,7 @@ def add_stock(item_id: str, amount: int):
     new_stock = g.redis.hincrby(f"item:{item_id}", "stock", int(amount))
 
     body = f"Item: {item_id} stock updated to: {new_stock}"
-    save_idempotency_http(g.redis, idem_key, 200, body)
+    save_idempotency(g.redis, idem_key, 200, body)
     return Response(body, status=200)
 
 
@@ -89,7 +87,7 @@ def remove_stock(item_id: str, amount: int):
     if int(amount) <= 0:
         abort(400, "Amount must be positive!")
     idem_key = request.headers.get("Idempotency-Key")
-    cached = check_idempotency_http(g.redis, idem_key)
+    cached = check_idempotency(g.redis, idem_key)
     if cached is not None:
         return Response(cached[1], status=cached[0])
 
@@ -110,7 +108,7 @@ def remove_stock(item_id: str, amount: int):
 
     new_stock = int(g.redis.hget(f"item:{item_id}", "stock"))
     body = f"Item: {item_id} stock updated to: {new_stock}"
-    save_idempotency_http(g.redis, idem_key, 200, body)
+    save_idempotency(g.redis, idem_key, 200, body)
     return Response(body, status=200)
 
 
@@ -118,10 +116,6 @@ def remove_stock(item_id: str, amount: int):
 def health():
     return jsonify({"status": "healthy"})
 
-
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
 
 import tpc
 import saga

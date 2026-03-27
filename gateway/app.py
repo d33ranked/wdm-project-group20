@@ -1,22 +1,4 @@
-# API Gateway — HTTP-to-Stream bridge.  Only active in SAGA mode.
-#
-# Request-response pattern
-# ------------------------
-# Every HTTP request that arrives at the gateway needs a response, but the
-# services process messages asynchronously.  We bridge them like this:
-#
-#   1. Assign a unique correlation_id to the HTTP request.
-#   2. Register the correlation_id in _pending (a dict of Events).
-#   3. XADD the payload to the right service stream.
-#   4. Block on the Event (up to REQUEST_TIMEOUT_S seconds).
-#   5. A background thread reads from the "gateway.responses" stream
-#      and calls event.set() when it sees the matching correlation_id.
-#   6. The main thread wakes up, reads the response, and returns HTTP.
-#
-# The gateway's response consumer uses plain XREAD (not XREADGROUP) with
-# start_id="$".  That means it only sees responses produced after this
-# gateway instance started — responses to requests that timed out are
-# ignored, which is exactly what we want.  No ACK needed.
+# api gateway — http-to-stream bridge; assigns correlation_id, blocks on threading.Event, returns http response
 
 import gevent.monkey
 
@@ -45,25 +27,18 @@ logger = logging.getLogger(__name__)
 
 app = Flask("gateway-service")
 
-# ---------------------------------------------------------------------------
-# StreamClient — publish a request and block for a correlated response
-# ---------------------------------------------------------------------------
 
 class StreamClient:
 
     def __init__(self, bus_pool):
         self._pool = bus_pool
-        # correlation_id → (threading.Event, response_dict | None)
-        self._pending: dict = {}
+        self._pending: dict = {}  # correlation_id → (event, response | None)
         self._pending_lock = threading.Lock()
         self._start_response_consumer()
 
     def send_request(self, stream: str, payload: dict, correlation_id: str) -> dict:
-        """Publish payload to stream, block until matching response arrives."""
+        # register before publishing to avoid race where response arrives first
         event = threading.Event()
-
-        # register BEFORE publishing — avoids a race where the response
-        # arrives before we have registered the event
         with self._pending_lock:
             self._pending[correlation_id] = (event, None)
 
@@ -87,17 +62,15 @@ class StreamClient:
             self._pending.pop(correlation_id, None)
 
     def _start_response_consumer(self):
-        """Background thread that reads gateway.responses and wakes waiting requests."""
         def consume():
             bus = get_bus(self._pool)
-            # "$" means only responses produced after this gateway instance started
-            last_id = "$"
+            last_id = "$"  # only responses produced after this instance started
             while True:
                 try:
                     result = bus.xread(
                         {RESPONSE_STREAM: last_id},
                         count=100,
-                        block=2000,  # wait up to 2 s, then loop
+                        block=2000,
                     )
                     if not result:
                         continue
@@ -107,12 +80,16 @@ class StreamClient:
                             try:
                                 self._handle_response(json.loads(fields["data"]))
                             except (KeyError, json.JSONDecodeError) as exc:
-                                logger.error("Malformed response entry %s: %s", msg_id, exc)
+                                logger.error(
+                                    "Malformed response entry %s: %s", msg_id, exc
+                                )
                 except Exception as exc:
                     logger.error("Response consumer error, retrying in 1s: %s", exc)
                     time.sleep(1)
 
-        threading.Thread(target=consume, daemon=True, name="stream-response-consumer").start()
+        threading.Thread(
+            target=consume, daemon=True, name="stream-response-consumer"
+        ).start()
 
     def _handle_response(self, payload: dict):
         correlation_id = payload.get("correlation_id")
@@ -121,29 +98,27 @@ class StreamClient:
         with self._pending_lock:
             entry = self._pending.get(correlation_id)
             if entry is None:
-                return  # response arrived after timeout — discard
+                return  # response arrived after timeout; discard
             event, _ = entry
             self._pending[correlation_id] = (event, payload)
         event.set()
 
 
-# ---------------------------------------------------------------------------
-# Flask proxy routes
-# ---------------------------------------------------------------------------
-
 def _proxy(service_stream: str, subpath: str, client: StreamClient):
     full_path = f"/{subpath}" if subpath else "/"
     correlation_id = request.correlation_id
 
-    forwarded_headers = {k: v for k, v in request.headers if k.lower() not in _STRIP_HEADERS}
+    forwarded_headers = {
+        k: v for k, v in request.headers if k.lower() not in _STRIP_HEADERS
+    }
 
     payload = {
-        "method":        request.method,
-        "path":          full_path,
+        "method": request.method,
+        "path": full_path,
         "correlation_id": correlation_id,
-        "query_params":  dict(request.args),
-        "headers":       forwarded_headers,
-        "body":          request.get_json(silent=True) or dict(request.form) or None,
+        "query_params": dict(request.args),
+        "headers": forwarded_headers,
+        "body": request.get_json(silent=True) or dict(request.form) or None,
     }
 
     try:
@@ -199,14 +174,9 @@ def health():
     return jsonify({"status": "healthy"})
 
 
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
-
 bus_pool = create_bus_pool()
 
-# pre-create the response stream so the consumer has something to XREAD
-# even before any service has published a response
+# pre-create response stream so xread doesn't error before any service has responded
 _startup_bus = get_bus(bus_pool)
 ensure_groups(_startup_bus, [(RESPONSE_STREAM, "gateway-init")])
 

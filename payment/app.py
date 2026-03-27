@@ -16,7 +16,7 @@ from common.redis_db import (
     setup_gunicorn_logging,
     LuaScripts,
 )
-from common.idempotency import check_idempotency_http, save_idempotency_http
+from common.idempotency import check_idempotency, save_idempotency
 from common.streams import create_bus_pool
 
 TRANSACTION_MODE = os.environ.get("TRANSACTION_MODE", "TPC")
@@ -31,11 +31,6 @@ bus_pool = create_bus_pool()
 
 # register all lua scripts once at startup — SHA1-cached in Redis after first call
 _scripts = LuaScripts(redis_lib.Redis(connection_pool=redis_pool))
-
-
-# ---------------------------------------------------------------------------
-# Flask Endpoints
-# ---------------------------------------------------------------------------
 
 
 @app.post("/create_user")
@@ -69,7 +64,7 @@ def add_credit(user_id: str, amount: int):
     if int(amount) <= 0:
         abort(400, "Amount must be positive!")
     idem_key = request.headers.get("Idempotency-Key")
-    cached = check_idempotency_http(g.redis, idem_key)
+    cached = check_idempotency(g.redis, idem_key)
     if cached is not None:
         return Response(cached[1], status=cached[0])
 
@@ -80,7 +75,7 @@ def add_credit(user_id: str, amount: int):
     new_credit = g.redis.hincrby(f"user:{user_id}", "credit", int(amount))
 
     body = f"User: {user_id} credit updated to: {new_credit}"
-    save_idempotency_http(g.redis, idem_key, 200, body)
+    save_idempotency(g.redis, idem_key, 200, body)
     return Response(body, status=200)
 
 
@@ -89,7 +84,7 @@ def remove_credit(user_id: str, amount: int):
     if int(amount) <= 0:
         abort(400, "Amount must be positive!")
     idem_key = request.headers.get("Idempotency-Key")
-    cached = check_idempotency_http(g.redis, idem_key)
+    cached = check_idempotency(g.redis, idem_key)
     if cached is not None:
         return Response(cached[1], status=cached[0])
 
@@ -109,7 +104,7 @@ def remove_credit(user_id: str, amount: int):
         raise
 
     body = f"User: {user_id} credit updated to: {new_credit}"
-    save_idempotency_http(g.redis, idem_key, 200, body)
+    save_idempotency(g.redis, idem_key, 200, body)
     return Response(body, status=200)
 
 
@@ -117,10 +112,6 @@ def remove_credit(user_id: str, amount: int):
 def health():
     return jsonify({"status": "healthy"})
 
-
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
 
 import tpc
 import saga

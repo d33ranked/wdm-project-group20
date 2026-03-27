@@ -83,7 +83,7 @@ def test_stock_fails_no_payment():
 # 3. Participant Crash — Stock Service Dies Mid-Saga, Recovers
 # ---------------------------------------------------------------------------
 def test_participant_crash_recovery():
-    """Stop stock service, restart after 3s, saga completes via Kafka persistence."""
+    """Stop stock service, restart after 3s, saga completes via redis stream pending re-delivery."""
     ITEM_PRICE = 10
     ITEM_QTY = 2
     STOCK = 5
@@ -107,7 +107,7 @@ def test_participant_crash_recovery():
     expected_stock = STOCK - ITEM_QTY
     expected_credit = CREDIT - (ITEM_PRICE * ITEM_QTY)
 
-    check("Checkout Completed After Stock Service Recovered — Kafka Message Persisted And Processed",
+    check("Checkout Completed After Stock Service Recovered — Stream Message Re-Delivered And Processed",
           r.status_code == 200, f"got {r.status_code}")
 
     wait_for_service(f"/stock/find/{item}")
