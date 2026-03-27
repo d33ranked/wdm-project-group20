@@ -1,4 +1,12 @@
-"""Order service 2PC coordinator — checkout, commit/abort helpers, recovery."""
+# order service 2PC coordinator — Redis version
+# state machine (same as before, now persisted in Redis):
+# started → preparing_stock → preparing_payment → committing → committed
+# Any vote-NO or timeout at any point → aborting → aborted
+# transaction log key: txn:{txn_id}  (Redis Hash)
+# fields: order_id, status, prepared_stock (JSON), prepared_payment, user_id, total_cost
+# checkout lock: checkout-lock:{order_id}  (Redis String, TTL 60s)
+# prevents two concurrent HTTP requests from double-checking out the same order
+# PostgreSQL handled this with SELECT FOR UPDATE; Redis uses SETNX
 
 import os
 import json
@@ -15,10 +23,6 @@ GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://nginx:80")
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# HTTP Helpers (Retry With Exponential Backoff)
-# ---------------------------------------------------------------------------
-
 def send_post_request(url, idempotency_key=None, max_retries=7, json_body=None):
     headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
     start = perf_counter()
@@ -32,7 +36,7 @@ def send_post_request(url, idempotency_key=None, max_retries=7, json_body=None):
             if attempt == max_retries:
                 abort(400, "Requests error")
         if attempt < max_retries:
-            time.sleep(min(0.5 * (2 ** attempt), 5))
+            time.sleep(min(0.5 * (2**attempt), 5))
     abort(400, "Requests error")
 
 
@@ -46,9 +50,74 @@ def send_get_request(url):
         abort(400, "Requests error")
 
 
-# ---------------------------------------------------------------------------
-# 2PC Participant Helpers
-# ---------------------------------------------------------------------------
+_LOCK_TTL_S = 60  # seconds — long enough for a full checkout round-trip
+
+
+def _acquire_checkout_lock(r, order_id: str, lock_token: str) -> bool:
+    # try to acquire an exclusive lock on this order's checkout
+    # SET NX EX is atomic: sets the key only if it does not already exist
+    # returns True if we got the lock, False if someone else holds it
+    return bool(r.set(f"checkout-lock:{order_id}", lock_token, nx=True, ex=_LOCK_TTL_S))
+
+
+def _release_checkout_lock(r, order_id: str, lock_token: str):
+    # release the lock only if we still own it
+    # uses a Lua script to make the check-and-delete atomic
+    # if we checked ownership and then deleted in two separate commands, a race could let us delete someone else's lock
+    release_script = r.register_script(
+        """
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+            redis.call('DEL', KEYS[1])
+            return 1
+        end
+        return 0
+    """
+    )
+    release_script(keys=[f"checkout-lock:{order_id}"], args=[lock_token])
+
+
+def _txn_key(txn_id: str) -> str:
+    return f"txn:{txn_id}"
+
+
+def _set_txn_status(r, txn_id: str, status: str):
+    # update the transaction status
+    # in PostgreSQL this was UPDATE + conn.commit()
+    # in Redis, HSET is immediately durable — no commit needed
+    r.hset(_txn_key(txn_id), "status", status)
+
+
+def _create_txn(r, txn_id: str, order_id: str, user_id: str, total_cost: int):
+    # create the initial transaction log entry
+    r.hset(
+        _txn_key(txn_id),
+        mapping={
+            "order_id": order_id,
+            "status": "started",
+            "prepared_stock": json.dumps([]),
+            "prepared_payment": "false",
+            "user_id": user_id,
+            "total_cost": str(total_cost),
+        },
+    )
+
+
+def _get_txn(r, txn_id: str) -> dict | None:
+    # read back a transaction log entry for recovery
+    # returns None if the transaction does not exist
+    data = r.hgetall(_txn_key(txn_id))
+    if not data:
+        return None
+    return {
+        "txn_id": txn_id,
+        "order_id": data["order_id"],
+        "status": data["status"],
+        "prepared_stock": json.loads(data.get("prepared_stock", "[]")),
+        "prepared_payment": data.get("prepared_payment", "false") == "true",
+        "user_id": data["user_id"],
+        "total_cost": int(data["total_cost"]),
+    }
+
 
 def rollback_stock(removed_items, transaction_id):
     for item_id, quantity in removed_items:
@@ -60,42 +129,53 @@ def rollback_stock(removed_items, transaction_id):
 
 def commit_tpc(txn_id, prepared_stock, prepared_payment):
     if prepared_stock:
-        send_post_request(f"{GATEWAY_URL}/stock/commit/{txn_id}", f"{txn_id}:stock:commit")
+        send_post_request(
+            f"{GATEWAY_URL}/stock/commit/{txn_id}",
+            f"{txn_id}:stock:commit",
+        )
     if prepared_payment:
-        send_post_request(f"{GATEWAY_URL}/payment/commit/{txn_id}", f"{txn_id}:payment:commit")
+        send_post_request(
+            f"{GATEWAY_URL}/payment/commit/{txn_id}",
+            f"{txn_id}:payment:commit",
+        )
 
 
 def abort_tpc(txn_id, prepared_stock, prepared_payment):
     if prepared_stock:
-        send_post_request(f"{GATEWAY_URL}/stock/abort/{txn_id}", f"{txn_id}:stock:abort")
+        send_post_request(
+            f"{GATEWAY_URL}/stock/abort/{txn_id}",
+            f"{txn_id}:stock:abort",
+        )
     if prepared_payment:
-        send_post_request(f"{GATEWAY_URL}/payment/abort/{txn_id}", f"{txn_id}:payment:abort")
+        send_post_request(
+            f"{GATEWAY_URL}/payment/abort/{txn_id}",
+            f"{txn_id}:payment:abort",
+        )
 
 
-# ---------------------------------------------------------------------------
-# 2PC Checkout
-#
-# State Machine:
-#   started -> preparing_stock -> preparing_payment -> committing -> committed
-#   Any vote-NO or failure -> aborting -> aborted
-#
-# Every State Transition Is Persisted Before The Next External Call.
-# ---------------------------------------------------------------------------
-
-def checkout_tpc(order_id):
-    conn = g.conn
+def checkout_tpc(order_id: str):
+    r = g.redis
     txn_id = str(uuid.uuid4())
+    lock_token = str(uuid.uuid4())
 
-    with conn.cursor() as cur:
-        # Step 1: Lock Order Row
-        cur.execute("SELECT paid, items, user_id, total_cost FROM orders WHERE id = %s FOR UPDATE", (order_id,))
-        row = cur.fetchone()
-        if row is None:
+    # ── Step 0: Acquire checkout lock ──────────────────────────────────────
+    # Prevents two concurrent requests from double-checking out the same
+    # order. The lock is released at the end (or expires after 60s on crash).
+    if not _acquire_checkout_lock(r, order_id, lock_token):
+        abort(409, f"Checkout already in progress for order {order_id}")
+
+    try:
+        # ── Step 1: Read and validate order ────────────────────────────────
+        order_data = r.hgetall(f"order:{order_id}")
+        if not order_data:
             abort(400, f"Order: {order_id} not found!")
-        paid, items, user_id, total_cost = row
 
-        if paid:
+        if order_data.get("paid") == "true":
             return Response("Order is already paid for!", status=200)
+
+        items = json.loads(order_data.get("items", "[]"))
+        user_id = order_data["user_id"]
+        total_cost = int(order_data.get("total_cost", 0))
 
         items_quantities = defaultdict(int)
         for item_id, qty in items:
@@ -103,19 +183,16 @@ def checkout_tpc(order_id):
         if not items_quantities:
             return Response("Order has no items.", status=200)
 
-        # Step 2: Create Transaction Log Entry
-        cur.execute(
-            "INSERT INTO transaction_log (txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (txn_id, order_id, "started", json.dumps([]), False, user_id, total_cost),
-        )
-        conn.commit()
+        # ── Step 2: Create transaction log entry ───────────────────────────
+        _create_txn(r, txn_id, order_id, user_id, total_cost)
 
-        # Step 3: Prepare All Stock Items In One Batch Request
-        cur.execute("UPDATE transaction_log SET status = 'preparing_stock' WHERE txn_id = %s", (txn_id,))
-        conn.commit()
+        # ── Step 3: Prepare stock ──────────────────────────────────────────
+        _set_txn_status(r, txn_id, "preparing_stock")
 
-        batch_items = [{"item_id": iid, "quantity": qty} for iid, qty in sorted(items_quantities.items())]
+        batch_items = [
+            {"item_id": iid, "quantity": qty}
+            for iid, qty in sorted(items_quantities.items())
+        ]
         prepared_stock = [[e["item_id"], e["quantity"]] for e in batch_items]
 
         stock_reply = send_post_request(
@@ -124,90 +201,105 @@ def checkout_tpc(order_id):
             json_body={"items": batch_items},
         )
         if stock_reply.status_code != 200:
-            # Stock Voted NO — Abort
-            cur.execute("UPDATE transaction_log SET status = 'aborting' WHERE txn_id = %s", (txn_id,))
-            conn.commit()
+            _set_txn_status(r, txn_id, "aborting")
             abort_tpc(txn_id, [], False)
-            cur.execute("UPDATE transaction_log SET status = 'aborted' WHERE txn_id = %s", (txn_id,))
-            conn.commit()
+            _set_txn_status(r, txn_id, "aborted")
             abort(400, "Failed to PREPARE stock")
 
-        # Persist Prepared Items For Crash Recovery
-        cur.execute("UPDATE transaction_log SET prepared_stock = %s WHERE txn_id = %s",
-                    (json.dumps(prepared_stock), txn_id))
-        conn.commit()
+        # Persist which items were prepared (needed for abort in recovery)
+        r.hset(_txn_key(txn_id), "prepared_stock", json.dumps(prepared_stock))
 
-        # Step 4: Prepare Payment
-        cur.execute("UPDATE transaction_log SET status = 'preparing_payment' WHERE txn_id = %s", (txn_id,))
-        conn.commit()
+        # ── Step 4: Prepare payment ────────────────────────────────────────
+        _set_txn_status(r, txn_id, "preparing_payment")
 
         payment_reply = send_post_request(
             f"{GATEWAY_URL}/payment/prepare/{txn_id}/{user_id}/{total_cost}",
             idempotency_key=f"{txn_id}:payment:prepare",
         )
         if payment_reply.status_code != 200:
-            # Payment Voted NO — Abort All
-            cur.execute("UPDATE transaction_log SET status = 'aborting' WHERE txn_id = %s", (txn_id,))
-            conn.commit()
+            _set_txn_status(r, txn_id, "aborting")
             abort_tpc(txn_id, prepared_stock, False)
-            cur.execute("UPDATE transaction_log SET status = 'aborted' WHERE txn_id = %s", (txn_id,))
-            conn.commit()
+            _set_txn_status(r, txn_id, "aborted")
             abort(400, "Failed to PREPARE payment")
 
-        cur.execute("UPDATE transaction_log SET prepared_payment = TRUE WHERE txn_id = %s", (txn_id,))
-        conn.commit()
+        r.hset(_txn_key(txn_id), "prepared_payment", "true")
 
-        # Step 5: Commit (Decision Is Final Once 'committing' Is Persisted)
-        cur.execute("UPDATE transaction_log SET status = 'committing' WHERE txn_id = %s", (txn_id,))
-        conn.commit()
+        # ── Step 5: Commit ─────────────────────────────────────────────────
+        # Once this HSET lands on disk (AOF), the decision is final.
+        # If the coordinator crashes after this point, recovery will re-commit.
+        _set_txn_status(r, txn_id, "committing")
 
         commit_tpc(txn_id, prepared_stock, True)
 
-        cur.execute("UPDATE orders SET paid = TRUE WHERE id = %s", (order_id,))
-        cur.execute("UPDATE transaction_log SET status = 'committed' WHERE txn_id = %s", (txn_id,))
-        conn.commit()
+        r.hset(f"order:{order_id}", "paid", "true")
+        _set_txn_status(r, txn_id, "committed")
+
+    finally:
+        # Always release the checkout lock, even on abort/exception
+        _release_checkout_lock(r, order_id, lock_token)
 
     return Response("Checkout successful", status=200)
 
 
 # ---------------------------------------------------------------------------
-# Recovery: Scan Transaction Log For Non-Terminal States On Startup
-#   started / preparing_stock / preparing_payment / aborting -> Abort
-#   committing -> Commit (Decision Was Already Made)
+# Recovery — runs at startup, resolves any non-terminal transactions
 # ---------------------------------------------------------------------------
 
-def recovery_tpc(conn_pool):
-    conn = conn_pool.getconn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost "
-                "FROM transaction_log WHERE status NOT IN ('committed', 'aborted')"
-            )
-            rows = cur.fetchall()
-            if not rows:
-                print("RECOVERY: No incomplete transactions found", flush=True)
-                return
 
-            for (txn_id, order_id, status, prepared_stock, prepared_payment, user_id, total_cost) in rows:
-                if prepared_stock is None:
-                    prepared_stock = []
-                elif isinstance(prepared_stock, str):
-                    try:
-                        prepared_stock = json.loads(prepared_stock) if prepared_stock else []
-                    except (TypeError, ValueError):
-                        prepared_stock = []
+def recovery_tpc(redis_pool):
+    """
+    Scan all txn:* keys. Any transaction not in a terminal state
+    (committed or aborted) is either re-committed or aborted depending on
+    how far it got before the crash.
 
-                print(f"RECOVERY: txn={txn_id}, status={status}", flush=True)
+    Rule:
+      committing  → always commit  (decision was made, must be honoured)
+      anything else → abort         (safer to undo than to re-drive forward)
+    """
+    import redis as redis_lib
 
-                if status in ("started", "preparing_stock", "preparing_payment", "aborting"):
-                    abort_tpc(txn_id, prepared_stock, prepared_payment)
-                    cur.execute("UPDATE transaction_log SET status = 'aborted' WHERE txn_id = %s", (txn_id,))
-                    conn.commit()
-                elif status == "committing":
-                    commit_tpc(txn_id, prepared_stock, prepared_payment)
-                    cur.execute("UPDATE orders SET paid = TRUE WHERE id = %s", (order_id,))
-                    cur.execute("UPDATE transaction_log SET status = 'committed' WHERE txn_id = %s", (txn_id,))
-                    conn.commit()
-    finally:
-        conn_pool.putconn(conn)
+    r = redis_lib.Redis(connection_pool=redis_pool)
+
+    # SCAN iterates keys matching the pattern without blocking Redis.
+    # cursor=0 starts a new scan; we stop when cursor returns to 0.
+    cursor = 0
+    recovered = 0
+    while True:
+        cursor, keys = r.scan(cursor, match="txn:*", count=100)
+        for key in keys:
+            txn_id = key[len("txn:") :]
+            txn = _get_txn(r, txn_id)
+            if txn is None:
+                continue
+            status = txn["status"]
+            if status in ("committed", "aborted"):
+                continue
+
+            print(f"RECOVERY TPC: txn={txn_id} status={status}", flush=True)
+            recovered += 1
+
+            if status == "committing":
+                commit_tpc(txn_id, txn["prepared_stock"], txn["prepared_payment"])
+                r.hset(f"order:{txn['order_id']}", "paid", "true")
+                _set_txn_status(r, txn_id, "committed")
+            else:
+                # started / preparing_stock / preparing_payment / aborting
+                abort_tpc(txn_id, txn["prepared_stock"], txn["prepared_payment"])
+                _set_txn_status(r, txn_id, "aborted")
+
+        if cursor == 0:
+            break
+
+    if recovered == 0:
+        print("RECOVERY TPC: No incomplete transactions found", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Module-level init — called from app.py to pass the bus client
+# (placeholder for Phase 3 when 2PC moves to Redis Streams)
+# ---------------------------------------------------------------------------
+
+
+def init_bus(bus_redis):
+    # reserved for Phase 3 — 2PC over Redis Streams
+    pass

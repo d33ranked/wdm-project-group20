@@ -1,67 +1,87 @@
-"""Order service data access — orders and sagas tables."""
+# order service database schema
+# order:{order_id} – hash { paid, items (JSON), user_id, total_cost }
+# saga:{saga_id} – hash { order_id, state, items_quantities (JSON), original_correlation_id, idempotency_key }
+
+# tpc acquires a short-lived checkout lock key before reading the order so concurrent requests serialize
+# stream consumer is single-threaded so two checkout messages for the same order are processed one at a time
+# final "mark paid" step uses the mark_order_paid Lua script which atomically checks-and-sets, guaranteeing no double charge even if the lock somehow fails
 
 import json
 
 
-# ---------------------------------------------------------------------------
-# Orders
-# ---------------------------------------------------------------------------
-
-def get_order(conn, order_id):
-    with conn.cursor() as cur:
-        cur.execute("SELECT paid, items, user_id, total_cost FROM orders WHERE id = %s", (order_id,))
-        row = cur.fetchone()
-    if row is None:
+# get an order
+def get_order(r, order_id: str) -> dict:
+    # fetch an order by id
+    # r : redis.Redis client
+    # raises ValueError if the order does not exist
+    data = r.hgetall(f"order:{order_id}")
+    if not data:
         raise ValueError(f"Order {order_id} not found")
-    return {"paid": row[0], "items": row[1], "user_id": row[2], "total_cost": row[3]}
-
-
-def get_order_for_update(conn, order_id):
-    with conn.cursor() as cur:
-        cur.execute("SELECT paid, items, user_id, total_cost FROM orders WHERE id = %s FOR UPDATE", (order_id,))
-        row = cur.fetchone()
-    if row is None:
-        raise ValueError(f"Order {order_id} not found")
-    return {"paid": row[0], "items": row[1], "user_id": row[2], "total_cost": row[3]}
-
-
-def mark_paid(conn, order_id):
-    with conn.cursor() as cur:
-        cur.execute("UPDATE orders SET paid = TRUE WHERE id = %s", (order_id,))
-
-
-# ---------------------------------------------------------------------------
-# Sagas
-# ---------------------------------------------------------------------------
-
-def create_saga(conn, saga_id, order_id, state, items_quantities,
-                original_correlation_id, idempotency_key):
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO sagas (id, order_id, state, items_quantities, "
-            "original_correlation_id, idempotency_key) VALUES (%s, %s, %s, %s, %s, %s)",
-            (saga_id, order_id, state, json.dumps(items_quantities),
-             original_correlation_id, idempotency_key),
-        )
-
-
-def get_saga_for_update(conn, saga_id):
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id, order_id, state, items_quantities, "
-            "original_correlation_id, idempotency_key "
-            "FROM sagas WHERE id = %s FOR UPDATE", (saga_id,),
-        )
-        row = cur.fetchone()
-    if row is None:
-        return None
     return {
-        "id": row[0], "order_id": row[1], "state": row[2],
-        "items_quantities": row[3], "original_correlation_id": row[4],
-        "idempotency_key": row[5],
+        "paid": data["paid"] == "true",
+        "items": json.loads(data.get("items", "[]")),
+        "user_id": data["user_id"],
+        "total_cost": int(data.get("total_cost", 0)),
     }
 
 
-def advance_saga(conn, saga_id, new_state):
-    with conn.cursor() as cur:
-        cur.execute("UPDATE sagas SET state = %s, updated_at = NOW() WHERE id = %s", (new_state, saga_id))
+# get an order for update
+def get_order_for_update(r, order_id: str) -> dict:
+    # alias for get_order — the 'for_update' distinction no longer applies
+    return get_order(r, order_id)
+
+
+# mark an order as paid
+def mark_paid(r, order_id: str):
+    # mark an order as paid
+    # r : redis.Redis client
+    # order_id : the id of the order to mark as paid
+    r.hset(f"order:{order_id}", "paid", "true")
+
+
+# create a new saga
+def create_saga(
+    r,
+    saga_id: str,
+    order_id: str,
+    state: str,
+    items_quantities: dict,
+    original_correlation_id: str,
+    idempotency_key: str,
+):
+    # persist a new saga record
+    # items_quantities is a {item_id: quantity} dict stored as a JSON string
+    r.hset(
+        f"saga:{saga_id}",
+        mapping={
+            "order_id": order_id,
+            "state": state,
+            "items_quantities": json.dumps(items_quantities),
+            "original_correlation_id": original_correlation_id or "",
+            "idempotency_key": idempotency_key or "",
+        },
+    )
+
+
+# get a saga for update
+def get_saga_for_update(r, saga_id: str) -> dict | None:
+    # fetch a saga by id
+    # returns None if not found
+    # the 'for_update' name is kept for API compatibility with saga.py
+    data = r.hgetall(f"saga:{saga_id}")
+    if not data:
+        return None
+    return {
+        "id": saga_id,
+        "order_id": data["order_id"],
+        "state": data["state"],
+        "items_quantities": json.loads(data["items_quantities"]),
+        "original_correlation_id": data.get("original_correlation_id", ""),
+        "idempotency_key": data.get("idempotency_key") or None,
+    }
+
+# advance a saga
+def advance_saga(r, saga_id: str, new_state: str):
+    # update the saga state
+    # each hset is immediately durable via AOF
+    r.hset(f"saga:{saga_id}", "state", new_state)
