@@ -1,11 +1,43 @@
-"""Stock 2PC participant — prepare/commit/abort + stale-transaction recovery."""
+"""Stock 2PC participant — prepare/commit/abort via Redis Lua scripts.
 
-from flask import g, abort, Response, request, jsonify
+Key schema
+----------
+item:{item_id}             Hash  { stock, price }
+prepared:stock:{txn_id}   Hash  { item_id: quantity, ... }  TTL 600s
+
+How prepare works
+-----------------
+prepare_stock_batch Lua script (atomic):
+  1. If prepared:stock:{txn_id} already exists → return 0 (idempotent, already prepared)
+  2. Check every item has sufficient stock → error if not
+  3. Deduct stock from every item
+  4. Record each {item_id: quantity} in the reservation hash
+  5. Set 600s TTL on the reservation hash (coordinator-crash safety net)
+
+Commit: just deletes the reservation hash (stock was already deducted at prepare time).
+Abort:  reads the reservation hash, restores stock for each item, deletes the hash.
+
+Recovery
+--------
+The order service (coordinator) scans its own txn:* keys on startup and calls
+commit or abort on all participants. No recovery logic is needed here.
+The 600s TTL on prepared:stock:* keys is a last-resort fallback if the
+coordinator never recovers — in practice the coordinator restarts within seconds.
+"""
+
+import redis as redis_lib
+from flask import g, abort, Response, request
+
+_redis_pool = None
+_scripts = None
 
 
-def init_routes(app):
+def init_routes(app, redis_pool, scripts):
+    global _redis_pool, _scripts
+    _redis_pool = redis_pool
+    _scripts = scripts
 
-    # PREPARE BATCH: Deduct All Items Atomically, Record All Reservations
+    # PREPARE BATCH — check stock, deduct, record reservation (all atomic)
     @app.post("/prepare_batch/<txn_id>")
     def prepare_batch(txn_id: str):
         body = request.get_json(silent=True) or {}
@@ -13,106 +45,63 @@ def init_routes(app):
         if not items:
             abort(400, "No items provided for prepare_batch")
 
-        cur = g.conn.cursor()
+        n = len(items)
+        # KEYS[1]       = "prepared:stock:{txn_id}"
+        # KEYS[2..n+1]  = "item:{id}" for each item
+        # ARGV[1]       = n
+        # ARGV[2..n+1]  = item_id strings
+        # ARGV[n+2..2n+1] = quantities
+        keys = [f"prepared:stock:{txn_id}"] + [f"item:{e['item_id']}" for e in items]
+        args = [n] + [e["item_id"] for e in items] + [int(e["quantity"]) for e in items]
 
-        # Already Prepared — Idempotent (check any item from this txn)
-        first_item_id = items[0]["item_id"]
-        cur.execute("SELECT 1 FROM prepared_transactions WHERE txn_id = %s AND item_id = %s",
-                    (txn_id, first_item_id))
-        if cur.fetchone() is not None:
-            cur.close()
-            return Response("Transaction already prepared", status=200)
-
-        # Lock All Items In Sorted Order To Prevent Deadlocks, Check Stock
-        item_ids = sorted(e["item_id"] for e in items)
-        cur.execute("SELECT id, stock FROM items WHERE id = ANY(%s) ORDER BY id FOR UPDATE", (item_ids,))
-        stock_map = {row[0]: row[1] for row in cur.fetchall()}
-
-        for entry in items:
-            item_id, quantity = entry["item_id"], int(entry["quantity"])
-            if item_id not in stock_map:
-                cur.close()
+        try:
+            _scripts.prepare_stock_batch(keys=keys, args=args, client=g.redis)
+        except redis_lib.exceptions.ResponseError as exc:
+            err = str(exc)
+            if "NOT_FOUND" in err:
+                item_id = err.split("item:")[-1]
                 abort(400, f"Item: {item_id} not found!")
-            if stock_map[item_id] < quantity:
-                cur.close()
+            if "INSUFFICIENT" in err:
+                item_id = err.split("item:")[-1]
                 abort(400, f"Item: {item_id} has insufficient stock!")
-
-        # Deduct And Record All — Atomic
-        for entry in items:
-            item_id, quantity = entry["item_id"], int(entry["quantity"])
-            cur.execute("UPDATE items SET stock = stock - %s WHERE id = %s", (quantity, item_id))
-            cur.execute("INSERT INTO prepared_transactions (txn_id, item_id, quantity) VALUES (%s, %s, %s)",
-                        (txn_id, item_id, quantity))
-        cur.close()
+            raise
+        # result 0 = already prepared (idempotent), result 1 = newly prepared
         return Response("Transaction prepared", status=200)
 
     # PREPARE (single item — kept for backward compatibility and direct tests)
     @app.post("/prepare/<txn_id>/<item_id>/<quantity>")
     def prepare_transaction(txn_id: str, item_id: str, quantity: int):
         quantity = int(quantity)
-        cur = g.conn.cursor()
+        # single-item call: n=1, item_id=ARGV[2], qty=ARGV[3]
+        keys = [f"prepared:stock:{txn_id}", f"item:{item_id}"]
+        args = [1, item_id, quantity]
 
-        # Already Prepared — Idempotent
-        cur.execute("SELECT 1 FROM prepared_transactions WHERE txn_id = %s AND item_id = %s", (txn_id, item_id))
-        if cur.fetchone() is not None:
-            cur.close()
-            return Response("Transaction already prepared", status=200)
-
-        # Check Sufficient Stock
-        cur.execute("SELECT stock FROM items WHERE id = %s FOR UPDATE", (item_id,))
-        row = cur.fetchone()
-        if row is None:
-            cur.close()
-            abort(400, f"Item: {item_id} not found!")
-        if row[0] < quantity:
-            cur.close()
-            abort(400, f"Item: {item_id} has insufficient stock!")
-
-        # Deduct And Record
-        cur.execute("UPDATE items SET stock = stock - %s WHERE id = %s", (quantity, item_id))
-        cur.execute("INSERT INTO prepared_transactions (txn_id, item_id, quantity) VALUES (%s, %s, %s)",
-                    (txn_id, item_id, quantity))
-        cur.close()
+        try:
+            _scripts.prepare_stock_batch(keys=keys, args=args, client=g.redis)
+        except redis_lib.exceptions.ResponseError as exc:
+            err = str(exc)
+            if "NOT_FOUND" in err:
+                abort(400, f"Item: {item_id} not found!")
+            if "INSUFFICIENT" in err:
+                abort(400, f"Item: {item_id} has insufficient stock!")
+            raise
         return Response("Transaction prepared", status=200)
 
-    # COMMIT: Delete Reservation (Deduction Already Applied)
+    # COMMIT — stock was already deducted at prepare time; just delete reservation
     @app.post("/commit/<txn_id>")
     def commit_transaction(txn_id: str):
-        cur = g.conn.cursor()
-        cur.execute("DELETE FROM prepared_transactions WHERE txn_id = %s", (txn_id,))
-        cur.close()
+        _scripts.commit_stock(keys=[f"prepared:stock:{txn_id}"], client=g.redis)
         return Response("Transaction committed", status=200)
 
-    # ABORT: Restore Stock, Delete Reservation
+    # ABORT — read reservation, restore stock for each item, delete reservation
     @app.post("/abort/<txn_id>")
     def abort_transaction(txn_id: str):
-        cur = g.conn.cursor()
-        cur.execute("SELECT item_id, quantity FROM prepared_transactions WHERE txn_id = %s", (txn_id,))
-        for item_id, quantity in cur.fetchall():
-            cur.execute("UPDATE items SET stock = stock + %s WHERE id = %s", (quantity, item_id))
-        cur.execute("DELETE FROM prepared_transactions WHERE txn_id = %s", (txn_id,))
-        cur.close()
+        _scripts.abort_stock(keys=[f"prepared:stock:{txn_id}"], client=g.redis)
         return Response("Transaction aborted", status=200)
 
 
-def recovery(conn_pool):
-    """Auto-Abort Prepared Transactions Older Than 5 Minutes."""
-    conn = conn_pool.getconn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT txn_id, item_id, quantity FROM prepared_transactions "
-                "WHERE created_at < NOW() - INTERVAL '5 minutes'"
-            )
-            rows = cur.fetchall()
-            if not rows:
-                print("RECOVERY: No stale prepared transactions found", flush=True)
-                return
-            for txn_id, item_id, quantity in rows:
-                print(f"RECOVERY: Aborting stale txn={txn_id}, item={item_id}", flush=True)
-                cur.execute("SELECT stock FROM items WHERE id = %s FOR UPDATE", (item_id,))
-                cur.execute("UPDATE items SET stock = stock + %s WHERE id = %s", (quantity, item_id))
-                cur.execute("DELETE FROM prepared_transactions WHERE txn_id = %s AND item_id = %s", (txn_id, item_id))
-                conn.commit()
-    finally:
-        conn_pool.putconn(conn)
+def recovery(redis_pool, scripts):
+    # coordinator-driven recovery: order service scans its txn:* keys on startup
+    # and explicitly calls commit/abort on all participants including this one
+    # prepared:stock:{txn_id} keys carry a 600s TTL as a last-resort safety net
+    print("RECOVERY STOCK: coordinator-driven — no participant-side action needed", flush=True)
