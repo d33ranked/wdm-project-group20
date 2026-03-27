@@ -190,6 +190,8 @@ def health():
 # start-up recovery and background consumers
 with app.app_context():
     if TRANSACTION_MODE == "TPC":
+        # init_bus must come before recovery so commit_tpc/abort_tpc can use streams
+        tpc.init_bus(bus_pool)
         try:
             tpc.recovery_tpc(redis_pool)
         except Exception as e:

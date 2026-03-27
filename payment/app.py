@@ -128,10 +128,18 @@ import saga
 with app.app_context():
     if TRANSACTION_MODE == "TPC":
         tpc.init_routes(app, redis_pool, _scripts)
+        tpc.init_tpc_stream(bus_pool)
         try:
             tpc.recovery(redis_pool, _scripts)
         except Exception as e:
             print(f"RECOVERY PAYMENT: {e}", flush=True)
+
+        threading.Thread(
+            target=tpc.start_tpc_consumer,
+            daemon=True,
+            name="tpc-consumer",
+        ).start()
+        print("TPC mode: Redis Streams consumer started", flush=True)
 
     elif TRANSACTION_MODE == "SAGA":
         saga.init(redis_pool, _scripts, bus_pool)

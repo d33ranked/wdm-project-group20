@@ -1,44 +1,171 @@
-# order service 2PC coordinator — Redis version
-# state machine (same as before, now persisted in Redis):
-# started → preparing_stock → preparing_payment → committing → committed
-# Any vote-NO or timeout at any point → aborting → aborted
-# transaction log key: txn:{txn_id}  (Redis Hash)
-# fields: order_id, status, prepared_stock (JSON), prepared_payment, user_id, total_cost
-# checkout lock: checkout-lock:{order_id}  (Redis String, TTL 60s)
-# prevents two concurrent HTTP requests from double-checking out the same order
-# PostgreSQL handled this with SELECT FOR UPDATE; Redis uses SETNX
+# order service 2PC coordinator — Redis Streams messaging (Phase 3).
+#
+# What changed from Phase 2
+# --------------------------
+# All coordinator→participant communication has moved from HTTP (via nginx)
+# to Redis Streams on redis-bus.  The participant HTTP endpoints on stock and
+# payment are still registered and still work for direct test access; only the
+# coordinator's outbound calls changed.
+#
+# Stream topology (all streams on redis-bus)
+# ------------------------------------------
+# tpc.stock     ← coordinator publishes prepare/commit/abort commands here
+# tpc.payment   ← same for payment
+# tpc.responses → stock and payment publish vote/ack responses here
+#
+# Request-response pattern (same as gateway/SAGA)
+# ------------------------------------------------
+# 1. Assign a correlation_id to the command.
+# 2. Register it in _tpc_client._pending (Event).
+# 3. XADD the command to tpc.stock or tpc.payment.
+# 4. Block on Event (up to TPC_TIMEOUT_S).
+# 5. Background thread reads tpc.responses, wakes the matching Event.
+#
+# Crash recovery
+# ---------------
+# tpc.stock and tpc.payment use XREADGROUP with consumer groups so unACKed
+# commands survive participant restarts.  On restart, read_pending_then_new
+# re-delivers any in-flight command before fetching new ones.
+# The coordinator itself uses plain XREAD with last_id="$" on tpc.responses
+# (only sees responses produced after it started — same reasoning as gateway).
+# On coordinator restart, recovery_tpc re-publishes commit/abort commands
+# which trigger fresh responses from participants.
 
-import os
 import json
 import uuid
 import time
 import logging
+import threading
 from collections import defaultdict
 from time import perf_counter
 
 import requests
 from flask import g, abort, Response
 
-GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://nginx:80")
+from common.streams import get_bus, ensure_groups, publish
+
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Stream names
+# ---------------------------------------------------------------------------
 
-def send_post_request(url, idempotency_key=None, max_retries=7, json_body=None):
-    headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
-    start = perf_counter()
-    for attempt in range(max_retries + 1):
+TPC_STOCK_STREAM    = "tpc.stock"
+TPC_PAYMENT_STREAM  = "tpc.payment"
+TPC_RESPONSE_STREAM = "tpc.responses"
+
+# How long to wait for a participant response before treating it as a vote-NO.
+# Stock restarts in ~3 s in the crash-recovery test; 15 s gives plenty of margin.
+TPC_TIMEOUT_S = 15
+
+
+# ---------------------------------------------------------------------------
+# TpcStreamClient — publish a command and block for a correlated response
+# ---------------------------------------------------------------------------
+
+class TpcStreamClient:
+    """Mirrors the gateway's StreamClient but for TPC coordinator→participant calls."""
+
+    def __init__(self, bus_pool):
+        self._pool = bus_pool
+        self._pending: dict = {}
+        self._pending_lock = threading.Lock()
+        self._start_response_consumer()
+
+    def send(self, stream: str, payload: dict, correlation_id: str) -> dict:
+        """Publish a TPC command and block until the participant responds."""
+        event = threading.Event()
+        with self._pending_lock:
+            self._pending[correlation_id] = (event, None)
+
+        bus = get_bus(self._pool)
         try:
-            response = requests.post(url, headers=headers, json=json_body, timeout=5)
-            if response.status_code < 500:
-                logger.debug("ORDER: POST took %.7fs", perf_counter() - start)
-                return response
-        except requests.exceptions.RequestException:
-            if attempt == max_retries:
-                abort(400, "Requests error")
-        if attempt < max_retries:
-            time.sleep(min(0.5 * (2**attempt), 5))
-    abort(400, "Requests error")
+            publish(bus, stream, payload)
+        except Exception as exc:
+            self._remove_pending(correlation_id)
+            logger.error("Failed to publish TPC command to '%s': %s", stream, exc)
+            return {"status_code": 400, "body": f"Bus publish error: {exc}"}
 
+        if not event.wait(timeout=TPC_TIMEOUT_S):
+            self._remove_pending(correlation_id)
+            logger.warning("TPC timeout waiting for response to %s", correlation_id)
+            return {"status_code": 400, "body": "TPC request timed out"}
+
+        with self._pending_lock:
+            _, response = self._pending.pop(correlation_id)
+        return response
+
+    def _remove_pending(self, correlation_id: str):
+        with self._pending_lock:
+            self._pending.pop(correlation_id, None)
+
+    def _start_response_consumer(self):
+        """Background thread reading tpc.responses and waking waiting commands."""
+        def consume():
+            bus = get_bus(self._pool)
+            last_id = "$"   # only responses produced after this instance started
+            while True:
+                try:
+                    result = bus.xread(
+                        {TPC_RESPONSE_STREAM: last_id},
+                        count=100,
+                        block=2000,
+                    )
+                    if not result:
+                        continue
+                    for _stream, entries in result:
+                        for msg_id, fields in entries:
+                            last_id = msg_id
+                            try:
+                                self._handle_response(json.loads(fields["data"]))
+                            except (KeyError, json.JSONDecodeError) as exc:
+                                logger.error("Malformed TPC response %s: %s", msg_id, exc)
+                except Exception as exc:
+                    logger.error("TPC response consumer error, retrying in 1s: %s", exc)
+                    time.sleep(1)
+
+        threading.Thread(
+            target=consume, daemon=True, name="tpc-response-consumer"
+        ).start()
+
+    def _handle_response(self, payload: dict):
+        correlation_id = payload.get("correlation_id")
+        if not correlation_id:
+            return
+        with self._pending_lock:
+            entry = self._pending.get(correlation_id)
+            if entry is None:
+                return   # response to a timed-out command — discard
+            event, _ = entry
+            self._pending[correlation_id] = (event, payload)
+        event.set()
+
+
+# ---------------------------------------------------------------------------
+# Module-level client — created by init_bus() at startup
+# ---------------------------------------------------------------------------
+
+_tpc_client: TpcStreamClient | None = None
+
+
+def init_bus(bus_pool):
+    """Create the TpcStreamClient.  Must be called before checkout or recovery."""
+    global _tpc_client
+    # Pre-create the response stream so XREAD doesn't error before any
+    # participant has ever published a response.
+    bus = get_bus(bus_pool)
+    ensure_groups(bus, [(TPC_RESPONSE_STREAM, "tpc-init")])
+    _tpc_client = TpcStreamClient(bus_pool)
+
+
+def _send(stream: str, payload: dict, correlation_id: str) -> dict:
+    """Send a TPC command and return the participant's response dict."""
+    return _tpc_client.send(stream, payload, correlation_id)
+
+
+# ---------------------------------------------------------------------------
+# HTTP helper — kept for the addItem price lookup (stock find, not TPC)
+# ---------------------------------------------------------------------------
 
 def send_get_request(url):
     try:
@@ -50,20 +177,18 @@ def send_get_request(url):
         abort(400, "Requests error")
 
 
-_LOCK_TTL_S = 60  # seconds — long enough for a full checkout round-trip
+# ---------------------------------------------------------------------------
+# Checkout lock (Redis SETNX)
+# ---------------------------------------------------------------------------
+
+_LOCK_TTL_S = 60
 
 
 def _acquire_checkout_lock(r, order_id: str, lock_token: str) -> bool:
-    # try to acquire an exclusive lock on this order's checkout
-    # SET NX EX is atomic: sets the key only if it does not already exist
-    # returns True if we got the lock, False if someone else holds it
     return bool(r.set(f"checkout-lock:{order_id}", lock_token, nx=True, ex=_LOCK_TTL_S))
 
 
 def _release_checkout_lock(r, order_id: str, lock_token: str):
-    # release the lock only if we still own it
-    # uses a Lua script to make the check-and-delete atomic
-    # if we checked ownership and then deleted in two separate commands, a race could let us delete someone else's lock
     release_script = r.register_script(
         """
         if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -71,98 +196,106 @@ def _release_checkout_lock(r, order_id: str, lock_token: str):
             return 1
         end
         return 0
-    """
+        """
     )
     release_script(keys=[f"checkout-lock:{order_id}"], args=[lock_token])
 
+
+# ---------------------------------------------------------------------------
+# Transaction log helpers
+# ---------------------------------------------------------------------------
 
 def _txn_key(txn_id: str) -> str:
     return f"txn:{txn_id}"
 
 
 def _set_txn_status(r, txn_id: str, status: str):
-    # update the transaction status
-    # in PostgreSQL this was UPDATE + conn.commit()
-    # in Redis, HSET is immediately durable — no commit needed
     r.hset(_txn_key(txn_id), "status", status)
 
 
 def _create_txn(r, txn_id: str, order_id: str, user_id: str, total_cost: int):
-    # create the initial transaction log entry
     r.hset(
         _txn_key(txn_id),
         mapping={
-            "order_id": order_id,
-            "status": "started",
-            "prepared_stock": json.dumps([]),
+            "order_id":        order_id,
+            "status":          "started",
+            "prepared_stock":  json.dumps([]),
             "prepared_payment": "false",
-            "user_id": user_id,
-            "total_cost": str(total_cost),
+            "user_id":         user_id,
+            "total_cost":      str(total_cost),
         },
     )
 
 
 def _get_txn(r, txn_id: str) -> dict | None:
-    # read back a transaction log entry for recovery
-    # returns None if the transaction does not exist
     data = r.hgetall(_txn_key(txn_id))
     if not data:
         return None
     return {
-        "txn_id": txn_id,
-        "order_id": data["order_id"],
-        "status": data["status"],
-        "prepared_stock": json.loads(data.get("prepared_stock", "[]")),
+        "txn_id":           txn_id,
+        "order_id":         data["order_id"],
+        "status":           data["status"],
+        "prepared_stock":   json.loads(data.get("prepared_stock", "[]")),
         "prepared_payment": data.get("prepared_payment", "false") == "true",
-        "user_id": data["user_id"],
-        "total_cost": int(data["total_cost"]),
+        "user_id":          data["user_id"],
+        "total_cost":       int(data["total_cost"]),
     }
 
 
-def rollback_stock(removed_items, transaction_id):
-    for item_id, quantity in removed_items:
-        send_post_request(
-            f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}",
-            idempotency_key=f"{transaction_id}:stock:rollback:{item_id}",
-        )
-
+# ---------------------------------------------------------------------------
+# Commit / Abort helpers (used by checkout and recovery)
+# ---------------------------------------------------------------------------
 
 def commit_tpc(txn_id, prepared_stock, prepared_payment):
+    """Send commit to stock and/or payment via Redis Streams."""
     if prepared_stock:
-        send_post_request(
-            f"{GATEWAY_URL}/stock/commit/{txn_id}",
-            f"{txn_id}:stock:commit",
-        )
+        corr_id = f"{txn_id}:stock:commit"
+        _send(TPC_STOCK_STREAM, {
+            "correlation_id": corr_id,
+            "command":        "commit",
+            "txn_id":         txn_id,
+        }, corr_id)
+
     if prepared_payment:
-        send_post_request(
-            f"{GATEWAY_URL}/payment/commit/{txn_id}",
-            f"{txn_id}:payment:commit",
-        )
+        corr_id = f"{txn_id}:payment:commit"
+        _send(TPC_PAYMENT_STREAM, {
+            "correlation_id": corr_id,
+            "command":        "commit",
+            "txn_id":         txn_id,
+        }, corr_id)
 
 
 def abort_tpc(txn_id, prepared_stock, prepared_payment):
+    """Send abort to stock and/or payment via Redis Streams."""
     if prepared_stock:
-        send_post_request(
-            f"{GATEWAY_URL}/stock/abort/{txn_id}",
-            f"{txn_id}:stock:abort",
-        )
-    if prepared_payment:
-        send_post_request(
-            f"{GATEWAY_URL}/payment/abort/{txn_id}",
-            f"{txn_id}:payment:abort",
-        )
+        corr_id = f"{txn_id}:stock:abort"
+        _send(TPC_STOCK_STREAM, {
+            "correlation_id": corr_id,
+            "command":        "abort",
+            "txn_id":         txn_id,
+        }, corr_id)
 
+    if prepared_payment:
+        corr_id = f"{txn_id}:payment:abort"
+        _send(TPC_PAYMENT_STREAM, {
+            "correlation_id": corr_id,
+            "command":        "abort",
+            "txn_id":         txn_id,
+        }, corr_id)
+
+
+# ---------------------------------------------------------------------------
+# Checkout
+# ---------------------------------------------------------------------------
 
 def checkout_tpc(order_id: str):
     r = g.redis
-    txn_id = str(uuid.uuid4())
+    txn_id     = str(uuid.uuid4())
     lock_token = str(uuid.uuid4())
 
     # ── Step 0: Acquire checkout lock ──────────────────────────────────────
-    # Prevents two concurrent requests from double-checking out the same
-    # order. The lock is released at the end (or expires after 60s on crash).
     if not _acquire_checkout_lock(r, order_id, lock_token):
-        abort(409, f"Checkout already in progress for order {order_id}")
+        return Response("Checkout already in progress", status=200)
 
     try:
         # ── Step 1: Read and validate order ────────────────────────────────
@@ -173,8 +306,8 @@ def checkout_tpc(order_id: str):
         if order_data.get("paid") == "true":
             return Response("Order is already paid for!", status=200)
 
-        items = json.loads(order_data.get("items", "[]"))
-        user_id = order_data["user_id"]
+        items      = json.loads(order_data.get("items", "[]"))
+        user_id    = order_data["user_id"]
         total_cost = int(order_data.get("total_cost", 0))
 
         items_quantities = defaultdict(int)
@@ -189,34 +322,41 @@ def checkout_tpc(order_id: str):
         # ── Step 3: Prepare stock ──────────────────────────────────────────
         _set_txn_status(r, txn_id, "preparing_stock")
 
-        batch_items = [
+        batch_items    = [
             {"item_id": iid, "quantity": qty}
             for iid, qty in sorted(items_quantities.items())
         ]
         prepared_stock = [[e["item_id"], e["quantity"]] for e in batch_items]
 
-        stock_reply = send_post_request(
-            f"{GATEWAY_URL}/stock/prepare_batch/{txn_id}",
-            idempotency_key=f"{txn_id}:stock:prepare_batch",
-            json_body={"items": batch_items},
-        )
-        if stock_reply.status_code != 200:
+        corr_id = f"{txn_id}:stock:prepare_batch"
+        stock_resp = _send(TPC_STOCK_STREAM, {
+            "correlation_id": corr_id,
+            "command":        "prepare_batch",
+            "txn_id":         txn_id,
+            "items":          batch_items,
+        }, corr_id)
+
+        if stock_resp.get("status_code") != 200:
             _set_txn_status(r, txn_id, "aborting")
             abort_tpc(txn_id, [], False)
             _set_txn_status(r, txn_id, "aborted")
             abort(400, "Failed to PREPARE stock")
 
-        # Persist which items were prepared (needed for abort in recovery)
         r.hset(_txn_key(txn_id), "prepared_stock", json.dumps(prepared_stock))
 
         # ── Step 4: Prepare payment ────────────────────────────────────────
         _set_txn_status(r, txn_id, "preparing_payment")
 
-        payment_reply = send_post_request(
-            f"{GATEWAY_URL}/payment/prepare/{txn_id}/{user_id}/{total_cost}",
-            idempotency_key=f"{txn_id}:payment:prepare",
-        )
-        if payment_reply.status_code != 200:
+        corr_id = f"{txn_id}:payment:prepare"
+        payment_resp = _send(TPC_PAYMENT_STREAM, {
+            "correlation_id": corr_id,
+            "command":        "prepare",
+            "txn_id":         txn_id,
+            "user_id":        user_id,
+            "amount":         total_cost,
+        }, corr_id)
+
+        if payment_resp.get("status_code") != 200:
             _set_txn_status(r, txn_id, "aborting")
             abort_tpc(txn_id, prepared_stock, False)
             _set_txn_status(r, txn_id, "aborted")
@@ -225,8 +365,8 @@ def checkout_tpc(order_id: str):
         r.hset(_txn_key(txn_id), "prepared_payment", "true")
 
         # ── Step 5: Commit ─────────────────────────────────────────────────
-        # Once this HSET lands on disk (AOF), the decision is final.
-        # If the coordinator crashes after this point, recovery will re-commit.
+        # Once this HSET lands (AOF), the decision is final.
+        # If the coordinator crashes here, recovery re-commits.
         _set_txn_status(r, txn_id, "committing")
 
         commit_tpc(txn_id, prepared_stock, True)
@@ -235,40 +375,35 @@ def checkout_tpc(order_id: str):
         _set_txn_status(r, txn_id, "committed")
 
     finally:
-        # Always release the checkout lock, even on abort/exception
         _release_checkout_lock(r, order_id, lock_token)
 
     return Response("Checkout successful", status=200)
 
 
 # ---------------------------------------------------------------------------
-# Recovery — runs at startup, resolves any non-terminal transactions
+# Recovery — runs at startup, resolves non-terminal transactions
 # ---------------------------------------------------------------------------
-
 
 def recovery_tpc(redis_pool):
     """
-    Scan all txn:* keys. Any transaction not in a terminal state
-    (committed or aborted) is either re-committed or aborted depending on
-    how far it got before the crash.
+    Scan all txn:* keys.  Any transaction not in a terminal state is either
+    re-committed or aborted depending on how far it got before the crash.
 
     Rule:
-      committing  → always commit  (decision was made, must be honoured)
-      anything else → abort         (safer to undo than to re-drive forward)
+      committing  → always commit  (decision was already made — must honour it)
+      anything else → abort        (safer to undo than to re-drive forward)
     """
     import redis as redis_lib
 
     r = redis_lib.Redis(connection_pool=redis_pool)
 
-    # SCAN iterates keys matching the pattern without blocking Redis.
-    # cursor=0 starts a new scan; we stop when cursor returns to 0.
-    cursor = 0
+    cursor    = 0
     recovered = 0
     while True:
         cursor, keys = r.scan(cursor, match="txn:*", count=100)
         for key in keys:
-            txn_id = key[len("txn:") :]
-            txn = _get_txn(r, txn_id)
+            txn_id = key[len("txn:"):]
+            txn    = _get_txn(r, txn_id)
             if txn is None:
                 continue
             status = txn["status"]
@@ -283,7 +418,6 @@ def recovery_tpc(redis_pool):
                 r.hset(f"order:{txn['order_id']}", "paid", "true")
                 _set_txn_status(r, txn_id, "committed")
             else:
-                # started / preparing_stock / preparing_payment / aborting
                 abort_tpc(txn_id, txn["prepared_stock"], txn["prepared_payment"])
                 _set_txn_status(r, txn_id, "aborted")
 
@@ -292,14 +426,3 @@ def recovery_tpc(redis_pool):
 
     if recovered == 0:
         print("RECOVERY TPC: No incomplete transactions found", flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Module-level init — called from app.py to pass the bus client
-# (placeholder for Phase 3 when 2PC moves to Redis Streams)
-# ---------------------------------------------------------------------------
-
-
-def init_bus(bus_redis):
-    # reserved for Phase 3 — 2PC over Redis Streams
-    pass

@@ -166,7 +166,7 @@ def handle_checkout_saga(r, order_id: str, headers: dict):
         return 400, {"error": str(exc)}
 
     if order["paid"]:
-        return 400, {"error": f"Order {order_id} is already paid"}
+        return 200, {"message": f"Order {order_id} is already paid"}
 
     items_quantities: dict = defaultdict(int)
     for item_id, quantity in order["items"]:
