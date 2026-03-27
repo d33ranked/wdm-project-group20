@@ -47,29 +47,28 @@ services:
       - INTERNAL_KAFKA_BOOTSTRAP_SERVERS=kafka-internal:9092
     command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
-      - env/order_db.env
+      - env/order_redis.env
     depends_on:
-      order-db:
+      redis-order:
         condition: service_healthy
       kafka-external:
         condition: service_healthy
       kafka-internal:
         condition: service_healthy
 
-  order-db:
-    image: postgres
-    environment:
-      - POSTGRES_USER=user
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_DB=orders
-    volumes:
-      - ./order/init.sql:/docker-entrypoint-initdb.d/init.sql
+  redis-order:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory-policy noeviction
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U user -d orders"]
-      interval: 3s
-      timeout: 5s
-      retries: 10
-      start_period: 5s
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
 
   stock-service:
     build:
@@ -83,29 +82,28 @@ services:
       - INTERNAL_KAFKA_BOOTSTRAP_SERVERS=kafka-internal:9092
     command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
-      - env/stock_db.env
+      - env/stock_redis.env
     depends_on:
-      stock-db:
+      redis-stock:
         condition: service_healthy
       kafka-external:
         condition: service_healthy
       kafka-internal:
         condition: service_healthy
 
-  stock-db:
-    image: postgres
-    environment:
-      - POSTGRES_USER=user
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_DB=stock
-    volumes:
-      - ./stock/init.sql:/docker-entrypoint-initdb.d/init.sql
+  redis-stock:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory-policy noeviction
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U user -d stock"]
-      interval: 3s
-      timeout: 5s
-      retries: 10
-      start_period: 5s
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
 
   payment-service:
     build:
@@ -119,29 +117,28 @@ services:
       - INTERNAL_KAFKA_BOOTSTRAP_SERVERS=kafka-internal:9092
     command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
-      - env/payment_db.env
+      - env/payment_redis.env
     depends_on:
-      payment-db:
+      redis-payment:
         condition: service_healthy
       kafka-external:
         condition: service_healthy
       kafka-internal:
         condition: service_healthy
 
-  payment-db:
-    image: postgres
-    environment:
-      - POSTGRES_USER=user
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_DB=payments
-    volumes:
-      - ./payment/init.sql:/docker-entrypoint-initdb.d/init.sql
+  redis-payment:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory-policy noeviction
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U user -d payments"]
-      interval: 3s
-      timeout: 5s
-      retries: 10
-      start_period: 5s
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
 
   kafka-external:
     image: apache/kafka:latest
