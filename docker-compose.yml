@@ -9,10 +9,17 @@ services:
       - "8001:8000"
     env_file:
       - env/bus.env
+      - env/sentinel.env
     environment:
       - REQUEST_TIMEOUT_MS=30000
     depends_on:
       redis-bus:
+        condition: service_healthy
+      sentinel-1:
+        condition: service_healthy
+      sentinel-2:
+        condition: service_healthy
+      sentinel-3:
         condition: service_healthy
       order-service:
         condition: service_started
@@ -47,10 +54,17 @@ services:
     env_file:
       - env/order_redis.env
       - env/bus.env
+      - env/sentinel.env
     depends_on:
       redis-order:
         condition: service_healthy
       redis-bus:
+        condition: service_healthy
+      sentinel-1:
+        condition: service_healthy
+      sentinel-2:
+        condition: service_healthy
+      sentinel-3:
         condition: service_healthy
 
   redis-order:
@@ -82,10 +96,17 @@ services:
     env_file:
       - env/stock_redis.env
       - env/bus.env
+      - env/sentinel.env
     depends_on:
       redis-stock:
         condition: service_healthy
       redis-bus:
+        condition: service_healthy
+      sentinel-1:
+        condition: service_healthy
+      sentinel-2:
+        condition: service_healthy
+      sentinel-3:
         condition: service_healthy
 
   redis-stock:
@@ -117,10 +138,17 @@ services:
     env_file:
       - env/payment_redis.env
       - env/bus.env
+      - env/sentinel.env
     depends_on:
       redis-payment:
         condition: service_healthy
       redis-bus:
+        condition: service_healthy
+      sentinel-1:
+        condition: service_healthy
+      sentinel-2:
+        condition: service_healthy
+      sentinel-3:
         condition: service_healthy
 
   redis-payment:

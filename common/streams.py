@@ -22,7 +22,27 @@ _STREAM_BATCH_SIZE = int(os.environ.get("STREAM_BATCH_SIZE", "500"))
 
 def create_bus_pool() -> redis_lib.ConnectionPool:
     # connect to shared redis-bus (separate from storage redis so crashes don't drop messages)
-    host = os.environ.get("REDIS_BUS_HOST", "redis-bus")
+    master_name = os.environ.get("REDIS_BUS_HOST", "redis-bus")  # matches sentinel monitor name
+
+    sentinel_hosts = os.environ.get("SENTINEL_HOSTS", "")
+    if sentinel_hosts:
+        from redis.sentinel import Sentinel
+        sentinel_port = int(os.environ.get("SENTINEL_PORT", "26379"))
+        addrs = [(h.strip(), sentinel_port) for h in sentinel_hosts.split(",")]
+        s = Sentinel(addrs, socket_timeout=0.5, socket_connect_timeout=2)
+        pool = s.master_for(
+            master_name,
+            decode_responses=True,
+            socket_keepalive=True,
+            socket_connect_timeout=2,
+            socket_timeout=15,
+            max_connections=_REDIS_MAX_CONNECTIONS,
+        ).connection_pool
+        logger.info("Redis bus Sentinel pool → master '%s' via %s", master_name, addrs)
+        return pool
+
+    # fallback: direct connection
+    host = master_name
     port = int(os.environ.get("REDIS_BUS_PORT", 6379))
     pool = redis_lib.ConnectionPool(
         host=host,
@@ -33,7 +53,7 @@ def create_bus_pool() -> redis_lib.ConnectionPool:
         socket_connect_timeout=2,
         socket_timeout=15,
     )
-    logger.info("Redis bus pool → %s:%s", host, port)
+    logger.info("Redis bus pool → %s:%s (direct, no sentinel)", host, port)
     return pool
 
 

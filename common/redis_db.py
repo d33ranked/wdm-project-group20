@@ -25,10 +25,33 @@ def create_redis_pool(service_name: str) -> redis.ConnectionPool:
     # decode_responses=True : automatically decode byte responses to strings for the client
     # socket_keepalive=True : keeps idle sockets alive
 
-    host = os.environ["REDIS_HOST"]
-    port = int(os.environ.get("REDIS_PORT", 6379))
+    master_name = os.environ["REDIS_HOST"]  # e.g. "redis-order" — matches sentinel monitor name
     max_connections = int(os.environ.get("REDIS_MAX_CONNECTIONS", "6000"))
 
+    sentinel_hosts = os.environ.get("SENTINEL_HOSTS", "")
+    if sentinel_hosts:
+        # sentinel pool: on every connection acquisition, asks sentinel who the current
+        # master is. after a failover the next connection automatically goes to the new
+        # primary — no application code changes needed anywhere else.
+        from redis.sentinel import Sentinel
+        sentinel_port = int(os.environ.get("SENTINEL_PORT", "26379"))
+        addrs = [(h.strip(), sentinel_port) for h in sentinel_hosts.split(",")]
+        s = Sentinel(addrs, socket_timeout=0.5, socket_connect_timeout=2)
+        pool = s.master_for(
+            master_name,
+            decode_responses=True,
+            socket_keepalive=True,
+            socket_connect_timeout=2,
+            socket_timeout=5,
+            max_connections=max_connections,
+        ).connection_pool
+        atexit.register(pool.disconnect)
+        logger.info("%s: Sentinel pool → master '%s' via %s", service_name, master_name, addrs)
+        return pool
+
+    # fallback: direct connection (no sentinel — useful for local dev without replicas)
+    host = master_name
+    port = int(os.environ.get("REDIS_PORT", 6379))
     pool = redis.ConnectionPool(
         host=host,
         port=port,
@@ -38,10 +61,8 @@ def create_redis_pool(service_name: str) -> redis.ConnectionPool:
         socket_connect_timeout=2,
         socket_timeout=5,
     )
-
-    # clean up the connection pool when service shuts down
     atexit.register(pool.disconnect)
-    logger.info("%s: Redis pool created → %s:%s", service_name, host, port)
+    logger.info("%s: Redis pool → %s:%s (direct, no sentinel)", service_name, host, port)
     return pool
 
 
