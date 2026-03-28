@@ -211,3 +211,75 @@ services:
     depends_on:
       redis-bus:
         condition: service_healthy
+
+  sentinel-1:
+    image: redis:7-alpine
+    restart: on-failure
+    volumes:
+      - ./sentinel.conf:/etc/redis/sentinel.conf.template:ro
+    command: >
+      sh -c "cp /etc/redis/sentinel.conf.template /tmp/sentinel.conf
+      && redis-sentinel /tmp/sentinel.conf"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    depends_on:
+      redis-order:
+        condition: service_healthy
+      redis-stock:
+        condition: service_healthy
+      redis-payment:
+        condition: service_healthy
+      redis-bus:
+        condition: service_healthy
+
+  sentinel-2:
+    image: redis:7-alpine
+    restart: on-failure
+    volumes:
+      - ./sentinel.conf:/etc/redis/sentinel.conf.template:ro
+    command: >
+      sh -c "cp /etc/redis/sentinel.conf.template /tmp/sentinel.conf
+      && redis-sentinel /tmp/sentinel.conf"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    depends_on:
+      redis-order:
+        condition: service_healthy
+      redis-stock:
+        condition: service_healthy
+      redis-payment:
+        condition: service_healthy
+      redis-bus:
+        condition: service_healthy
+
+  sentinel-3:
+    image: redis:7-alpine
+    restart: on-failure
+    volumes:
+      - ./sentinel.conf:/etc/redis/sentinel.conf.template:ro
+    command: >
+      sh -c "cp /etc/redis/sentinel.conf.template /tmp/sentinel.conf
+      && redis-sentinel /tmp/sentinel.conf"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    depends_on:
+      redis-order:
+        condition: service_healthy
+      redis-stock:
+        condition: service_healthy
+      redis-payment:
+        condition: service_healthy
+      redis-bus:
+        condition: service_healthy
