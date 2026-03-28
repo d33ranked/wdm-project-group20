@@ -129,40 +129,40 @@ def _dispatch(command: str, payload: dict, r) -> tuple:
     return 400, {"error": f"Unknown TPC command: {command}"}
 
 
+def _handle_message(msg_id: str, payload: dict):
+    # each message runs in its own greenlet so the entire batch is processed concurrently
+    # gevent yields during every redis i/o call, so 100 messages overlap their network waits
+    # instead of stacking sequentially (100 × 1.5ms → ~1.5ms wall time for the batch)
+    correlation_id = payload.get("correlation_id")
+    command = payload.get("command")
+    r = redis_lib.Redis(connection_pool=_redis_pool)
+    try:
+        status_code, body = _dispatch(command, payload, r)
+    except Exception as exc:
+        logger.error(
+            "TPC command error %s/%s: %s", command, correlation_id, exc, exc_info=True
+        )
+        status_code, body = 400, {"error": "Internal TPC error"}
+
+    bus = get_bus(_bus_pool)
+    publish(bus, TPC_RESPONSE_STREAM, {
+        "correlation_id": correlation_id,
+        "status_code": status_code,
+        "body": body,
+    })
+    ack(bus, TPC_STREAM, TPC_GROUP, msg_id)
+
+
 def start_tpc_consumer():
     # consume tpc.stock commands; ack after response published for at-least-once delivery
+    import gevent
     logger.info("Stock TPC consumer started on stream '%s'", TPC_STREAM)
     while True:
         try:
-            bus = get_bus(_bus_pool)
-            for msg_id, payload in read_pending_then_new(bus, TPC_STREAM, TPC_GROUP):
-                correlation_id = payload.get("correlation_id")
-                command = payload.get("command")
-
-                r = redis_lib.Redis(connection_pool=_redis_pool)
-                try:
-                    status_code, body = _dispatch(command, payload, r)
-                except Exception as exc:
-                    logger.error(
-                        "TPC command error %s/%s: %s",
-                        command,
-                        correlation_id,
-                        exc,
-                        exc_info=True,
-                    )
-                    status_code, body = 400, {"error": "Internal TPC error"}
-
-                publish(
-                    get_bus(_bus_pool),
-                    TPC_RESPONSE_STREAM,
-                    {
-                        "correlation_id": correlation_id,
-                        "status_code": status_code,
-                        "body": body,
-                    },
-                )
-                ack(bus, TPC_STREAM, TPC_GROUP, msg_id)
-
+            msgs = read_pending_then_new(get_bus(_bus_pool), TPC_STREAM, TPC_GROUP)
+            if msgs:
+                # spawn one greenlet per message and wait for all to finish before next read
+                gevent.joinall([gevent.spawn(_handle_message, mid, pl) for mid, pl in msgs])
         except Exception as exc:
             logger.error("Stock TPC consumer error, retrying in 1s: %s", exc)
             time.sleep(1)

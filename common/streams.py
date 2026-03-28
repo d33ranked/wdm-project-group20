@@ -12,6 +12,13 @@ BLOCK_MS = 2_000  # blocking xreadgroup timeout per iteration
 import os as _os
 CONSUMER_NAME = f"worker-{_os.getpid()}"  # unique per process so pending re-delivery is per-worker
 
+_REDIS_MAX_CONNECTIONS = int(os.environ.get("REDIS_MAX_CONNECTIONS", "6000"))
+# batch size: how many stream messages are pulled per xreadgroup call
+# with concurrent processing (gevent.spawn per message), all messages in a batch run simultaneously
+# so larger batches only reduce xreadgroup round-trip overhead — they no longer hurt tail latency
+# 500 means 10 xreadgroup calls to drain a 5000-message queue instead of 500
+_STREAM_BATCH_SIZE = int(os.environ.get("STREAM_BATCH_SIZE", "500"))
+
 
 def create_bus_pool() -> redis_lib.ConnectionPool:
     # connect to shared redis-bus (separate from storage redis so crashes don't drop messages)
@@ -20,7 +27,7 @@ def create_bus_pool() -> redis_lib.ConnectionPool:
     pool = redis_lib.ConnectionPool(
         host=host,
         port=port,
-        max_connections=1200,
+        max_connections=_REDIS_MAX_CONNECTIONS,
         decode_responses=True,
         socket_keepalive=True,
         socket_connect_timeout=2,
@@ -68,7 +75,7 @@ def _xreadgroup(bus, stream, group, start_id, block):
             group,
             CONSUMER_NAME,
             {stream: start_id},
-            count=100,
+            count=_STREAM_BATCH_SIZE,
             block=BLOCK_MS if block else None,
         )
     except redis_lib.exceptions.ResponseError as exc:

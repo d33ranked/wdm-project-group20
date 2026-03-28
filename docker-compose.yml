@@ -41,7 +41,9 @@ services:
     environment:
       - TRANSACTION_MODE=${TRANSACTION_MODE:-TPC}
       - STOCK_SERVICE_URL=http://stock-service:5000
-    command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
+      - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-6000}
+      - STREAM_BATCH_SIZE=${STREAM_BATCH_SIZE:-500}
+    command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --worker-connections 6000 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
       - env/bus.env
@@ -58,6 +60,7 @@ services:
       --appendonly yes
       --appendfsync everysec
       --maxmemory-policy noeviction
+      --maxclients 7000
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -73,7 +76,9 @@ services:
     restart: on-failure
     environment:
       - TRANSACTION_MODE=${TRANSACTION_MODE:-TPC}
-    command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
+      - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-6000}
+      - STREAM_BATCH_SIZE=${STREAM_BATCH_SIZE:-500}
+    command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --worker-connections 6000 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
       - env/bus.env
@@ -90,6 +95,7 @@ services:
       --appendonly yes
       --appendfsync everysec
       --maxmemory-policy noeviction
+      --maxclients 7000
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -105,7 +111,9 @@ services:
     restart: on-failure
     environment:
       - TRANSACTION_MODE=${TRANSACTION_MODE:-TPC}
-    command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
+      - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-6000}
+      - STREAM_BATCH_SIZE=${STREAM_BATCH_SIZE:-500}
+    command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --worker-connections 6000 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
       - env/bus.env
@@ -122,6 +130,7 @@ services:
       --appendonly yes
       --appendfsync everysec
       --maxmemory-policy noeviction
+      --maxclients 7000
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -139,6 +148,7 @@ services:
       --appendonly yes
       --appendfsync everysec
       --maxmemory-policy noeviction
+      --maxclients 20000
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
