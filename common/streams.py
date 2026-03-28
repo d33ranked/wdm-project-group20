@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 
 import redis as redis_lib
 
@@ -77,6 +78,58 @@ def read_pending_then_new(bus: redis_lib.Redis, stream: str, group: str) -> list
 
 def ack(bus: redis_lib.Redis, stream: str, group: str, message_id: str):
     bus.xack(stream, group, message_id)
+
+
+def publish_response(bus, stream: str, correlation_id: str, status_code: int, body):
+    """Publish a standard response envelope to a stream."""
+    publish(bus, stream, {
+        "correlation_id": correlation_id,
+        "status_code": status_code,
+        "body": body,
+    })
+
+
+def make_message_handler(get_bus_fn, get_r_fn, stream: str, group: str, response_stream: str, route_fn):
+    """Return a greenlet-safe message handler for a stream consumer.
+
+    The returned function follows the (msg_id, payload) -> None signature
+    expected by run_gevent_consumer. It calls route_fn(payload, r) which must
+    return (status_code, body), then publishes the response and acks the message.
+    """
+    def handle(msg_id: str, payload: dict):
+        correlation_id = payload.get("correlation_id")
+        bus = get_bus_fn()
+        if not correlation_id:
+            ack(bus, stream, group, msg_id)
+            return
+        r = get_r_fn()
+        try:
+            status_code, body = route_fn(payload, r)
+        except Exception as exc:
+            logger.error("Error processing %s: %s", correlation_id, exc, exc_info=True)
+            status_code, body = 400, {"error": "Internal server error"}
+        publish_response(bus, response_stream, correlation_id, status_code, body)
+        ack(bus, stream, group, msg_id)
+    return handle
+
+
+def run_gevent_consumer(bus_pool, stream: str, group: str, handler_fn, name: str = ""):
+    """Run a blocking gevent consumer loop for a stream group.
+
+    Reads pending messages first (at-least-once delivery), then new ones.
+    Spawns one greenlet per message so the batch executes concurrently.
+    Retries on errors with a 1-second back-off.
+    """
+    import gevent
+    logger.info("%s consumer started on stream '%s'", name, stream)
+    while True:
+        try:
+            msgs = read_pending_then_new(get_bus(bus_pool), stream, group)
+            if msgs:
+                gevent.joinall([gevent.spawn(handler_fn, mid, pl) for mid, pl in msgs])
+        except Exception as exc:
+            logger.error("%s consumer error, retrying in 1s: %s", name, exc)
+            time.sleep(1)
 
 
 def _xreadgroup(bus, stream, group, start_id, block):

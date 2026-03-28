@@ -6,7 +6,7 @@ COPY order/requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY common/ ./common/
-COPY order/app.py order/db.py order/tpc.py order/saga.py ./
+COPY order/app.py order/db.py order/tpc.py order/saga.py order/operations.py ./
 
 ENV PYTHONUNBUFFERED=1
 

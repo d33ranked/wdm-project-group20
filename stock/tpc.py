@@ -4,7 +4,7 @@ import logging
 import redis as redis_lib
 from flask import g, abort, Response, request
 
-from common.streams import get_bus, ensure_groups, publish, read_pending_then_new, ack
+from common.streams import get_bus, ensure_groups, publish_response, run_gevent_consumer, ack
 
 logger = logging.getLogger(__name__)
 
@@ -136,27 +136,13 @@ def _handle_message(msg_id: str, payload: dict):
             "TPC command error %s/%s: %s", command, correlation_id, exc, exc_info=True
         )
         status_code, body = 400, {"error": "Internal TPC error"}
-
     bus = get_bus(_bus_pool)
-    publish(bus, TPC_RESPONSE_STREAM, {
-        "correlation_id": correlation_id,
-        "status_code": status_code,
-        "body": body,
-    })
+    publish_response(bus, TPC_RESPONSE_STREAM, correlation_id, status_code, body)
     ack(bus, TPC_STREAM, TPC_GROUP, msg_id)
 
 
 def start_tpc_consumer():
-    import gevent
-    logger.info("Stock TPC consumer started on stream '%s'", TPC_STREAM)
-    while True:
-        try:
-            msgs = read_pending_then_new(get_bus(_bus_pool), TPC_STREAM, TPC_GROUP)
-            if msgs:
-                gevent.joinall([gevent.spawn(_handle_message, mid, pl) for mid, pl in msgs])
-        except Exception as exc:
-            logger.error("Stock TPC consumer error, retrying in 1s: %s", exc)
-            time.sleep(1)
+    run_gevent_consumer(_bus_pool, TPC_STREAM, TPC_GROUP, _handle_message, "Stock TPC")
 
 
 def recovery(redis_pool, scripts):

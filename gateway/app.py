@@ -12,6 +12,7 @@ import uuid
 import redis as redis_lib
 from flask import Flask, Response, abort, jsonify, request
 
+from common.stream_rpc import StreamRpc
 from common.streams import create_bus_pool, get_bus, ensure_groups, publish
 
 GATEWAY_STREAMS = ["gateway.orders", "gateway.stock", "gateway.payment"]
@@ -30,33 +31,14 @@ class StreamClient:
 
     def __init__(self, bus_pool):
         self._pool = bus_pool
-        self._pending: dict = {}
-        self._pending_lock = threading.Lock()
+        self._rpc = StreamRpc(default_timeout=REQUEST_TIMEOUT_S)
         self._start_response_consumer()
 
     def send_request(self, stream: str, payload: dict, correlation_id: str) -> dict:
-        event = threading.Event()
-        with self._pending_lock:
-            self._pending[correlation_id] = (event, None)
-
-        bus = get_bus(self._pool)
-        try:
-            publish(bus, stream, payload)
-        except Exception as exc:
-            self._remove_pending(correlation_id)
-            raise RuntimeError(f"Failed to publish to '{stream}': {exc}") from exc
-
-        if not event.wait(timeout=REQUEST_TIMEOUT_S):
-            self._remove_pending(correlation_id)
+        response = self._rpc.send(self._pool, stream, payload, correlation_id)
+        if response.get("status_code") == 400 and "timed out" in str(response.get("body", "")):
             abort(504, description="Gateway timeout waiting for service response")
-
-        with self._pending_lock:
-            _, response = self._pending.pop(correlation_id)
         return response
-
-    def _remove_pending(self, correlation_id: str):
-        with self._pending_lock:
-            self._pending.pop(correlation_id, None)
 
     def _start_response_consumer(self):
         def consume():
@@ -75,7 +57,10 @@ class StreamClient:
                         for msg_id, fields in entries:
                             last_id = msg_id
                             try:
-                                self._handle_response(json.loads(fields["data"]))
+                                payload = json.loads(fields["data"])
+                                corr_id = payload.get("correlation_id", "")
+                                if corr_id:
+                                    self._rpc.handle_response(corr_id, payload)
                             except (KeyError, json.JSONDecodeError) as exc:
                                 logger.error(
                                     "Malformed response entry %s: %s", msg_id, exc
@@ -87,18 +72,6 @@ class StreamClient:
         threading.Thread(
             target=consume, daemon=True, name="stream-response-consumer"
         ).start()
-
-    def _handle_response(self, payload: dict):
-        correlation_id = payload.get("correlation_id")
-        if not correlation_id:
-            return
-        with self._pending_lock:
-            entry = self._pending.get(correlation_id)
-            if entry is None:
-                return
-            event, _ = entry
-            self._pending[correlation_id] = (event, payload)
-        event.set()
 
 
 def _proxy(service_stream: str, subpath: str, client: StreamClient):
@@ -118,15 +91,11 @@ def _proxy(service_stream: str, subpath: str, client: StreamClient):
         "body": request.get_json(silent=True) or dict(request.form) or None,
     }
 
-    try:
-        response = client.send_request(
-            stream=service_stream,
-            payload=payload,
-            correlation_id=correlation_id,
-        )
-    except RuntimeError as exc:
-        logger.error("Stream publish error for '%s': %s", service_stream, exc)
-        abort(502, description="Service temporarily unavailable")
+    response = client.send_request(
+        stream=service_stream,
+        payload=payload,
+        correlation_id=correlation_id,
+    )
 
     return _build_response(response)
 

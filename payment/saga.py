@@ -1,5 +1,3 @@
-# payment saga participant — redis streams, at-least-once delivery via pending re-read
-
 import uuid
 import time
 import json
@@ -11,9 +9,9 @@ from common.idempotency import check_idempotency, save_idempotency
 from common.streams import (
     get_bus,
     ensure_groups,
-    publish,
-    read_pending_then_new,
-    ack,
+    publish_response,
+    make_message_handler,
+    run_gevent_consumer,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,20 +53,17 @@ def _get_bus():
 
 
 def route_stream_message(payload, r):
-    # dispatch inbound stream message; returns (status_code, body)
     method = payload.get("method", "GET").upper()
     path = payload.get("path", "/")
     headers = payload.get("headers") or {}
     segments = [s for s in path.strip("/").split("/") if s]
     idem_key = headers.get("Idempotency-Key") or headers.get("idempotency-key")
 
-    # POST /create_user
     if method == "POST" and segments and segments[0] == "create_user":
         user_id = str(uuid.uuid4())
         r.hset(f"user:{user_id}", mapping={"credit": "0"})
         return 201, {"user_id": user_id}
 
-    # POST /batch_init/<n>/<starting_money>
     if method == "POST" and len(segments) >= 3 and segments[0] == "batch_init":
         n, starting_money = int(segments[1]), int(segments[2])
         pipe = r.pipeline(transaction=False)
@@ -77,7 +72,6 @@ def route_stream_message(payload, r):
         pipe.execute()
         return 200, {"msg": "Batch init for users successful"}
 
-    # GET /find_user/<user_id>
     if method == "GET" and len(segments) >= 2 and segments[0] == "find_user":
         user_id = segments[1]
         data = r.hgetall(f"user:{user_id}")
@@ -85,7 +79,6 @@ def route_stream_message(payload, r):
             return 400, {"error": f"User {user_id} not found"}
         return 200, {"user_id": user_id, "credit": int(data["credit"])}
 
-    # POST /add_funds/<user_id>/<amount>
     if method == "POST" and len(segments) >= 3 and segments[0] == "add_funds":
         user_id, amount = segments[1], int(segments[2])
         if amount <= 0:
@@ -100,7 +93,6 @@ def route_stream_message(payload, r):
         save_idempotency(r, idem_key, 200, resp)
         return 200, resp
 
-    # POST /pay/<user_id>/<amount>
     if method == "POST" and len(segments) >= 3 and segments[0] == "pay":
         user_id, amount = segments[1], int(segments[2])
         if amount <= 0:
@@ -108,7 +100,6 @@ def route_stream_message(payload, r):
         cached = check_idempotency(r, idem_key)
         if cached:
             return cached
-        # deduct_credit lua: atomically checks credit >= amount then deducts
         try:
             new_credit = _scripts.deduct_credit(
                 keys=[f"user:{user_id}"],
@@ -129,89 +120,23 @@ def route_stream_message(payload, r):
     return 404, {"error": f"No handler for {method} {path}"}
 
 
-def _publish_response(
-    response_stream: str, correlation_id: str, status_code: int, body
-):
-    publish(
-        _get_bus(),
-        response_stream,
-        {
-            "correlation_id": correlation_id,
-            "status_code": status_code,
-            "body": body,
-        },
-    )
-
-
-def _handle_gateway_message(msg_id: str, payload: dict):
-    # runs in its own greenlet — all messages in a batch execute concurrently
-    # gevent yields on every redis i/o call so 500 messages overlap their network waits
-    correlation_id = payload.get("correlation_id")
-    bus = _get_bus()
-    if not correlation_id:
-        ack(bus, GATEWAY_STREAM, GROUP_GATEWAY, msg_id)
-        return
-    r = _get_r()
-    try:
-        status_code, body = route_stream_message(payload, r)
-    except Exception as exc:
-        logger.error("Error processing %s: %s", correlation_id, exc, exc_info=True)
-        status_code, body = 400, {"error": "Internal server error"}
-    _publish_response(GATEWAY_RESPONSE_STREAM, correlation_id, status_code, body)
-    ack(bus, GATEWAY_STREAM, GROUP_GATEWAY, msg_id)
-
-
-def _handle_internal_message(msg_id: str, payload: dict):
-    # runs in its own greenlet — same concurrent pattern as gateway handler
-    correlation_id = payload.get("correlation_id")
-    bus = _get_bus()
-    if not correlation_id:
-        ack(bus, INTERNAL_STREAM, GROUP_INTERNAL, msg_id)
-        return
-    r = _get_r()
-    try:
-        status_code, body = route_stream_message(payload, r)
-    except Exception as exc:
-        logger.error("Error processing %s: %s", correlation_id, exc, exc_info=True)
-        status_code, body = 400, {"error": "Internal server error"}
-    _publish_response(INTERNAL_RESPONSE_STREAM, correlation_id, status_code, body)
-    ack(bus, INTERNAL_STREAM, GROUP_INTERNAL, msg_id)
+_handle_gateway_message = make_message_handler(
+    _get_bus, _get_r, GATEWAY_STREAM, GROUP_GATEWAY, GATEWAY_RESPONSE_STREAM, route_stream_message
+)
+_handle_internal_message = make_message_handler(
+    _get_bus, _get_r, INTERNAL_STREAM, GROUP_INTERNAL, INTERNAL_RESPONSE_STREAM, route_stream_message
+)
 
 
 def start_gateway_consumer():
-    # consume gateway.payment; spawn one greenlet per message so the batch runs concurrently
-    import gevent
-    logger.info("Payment gateway consumer started on stream '%s'", GATEWAY_STREAM)
-    while True:
-        try:
-            msgs = read_pending_then_new(get_bus(_bus_pool), GATEWAY_STREAM, GROUP_GATEWAY)
-            if msgs:
-                gevent.joinall(
-                    [gevent.spawn(_handle_gateway_message, mid, pl) for mid, pl in msgs]
-                )
-        except Exception as exc:
-            logger.error("Payment gateway consumer error, retrying in 1s: %s", exc)
-            time.sleep(1)
+    run_gevent_consumer(_bus_pool, GATEWAY_STREAM, GROUP_GATEWAY, _handle_gateway_message, "Payment gateway")
 
 
 def start_internal_consumer():
-    # consume internal.payment; same concurrent pattern as gateway consumer
-    import gevent
-    logger.info("Payment internal consumer started on stream '%s'", INTERNAL_STREAM)
-    while True:
-        try:
-            msgs = read_pending_then_new(get_bus(_bus_pool), INTERNAL_STREAM, GROUP_INTERNAL)
-            if msgs:
-                gevent.joinall(
-                    [gevent.spawn(_handle_internal_message, mid, pl) for mid, pl in msgs]
-                )
-        except Exception as exc:
-            logger.error("Payment internal consumer error, retrying in 1s: %s", exc)
-            time.sleep(1)
+    run_gevent_consumer(_bus_pool, INTERNAL_STREAM, GROUP_INTERNAL, _handle_internal_message, "Payment internal")
 
 
 def recovery_saga(redis_pool):
-    # participant only — orchestrator (order service) drives recovery
     print(
         "SAGA RECOVERY PAYMENT: participant only — no saga state to recover", flush=True
     )

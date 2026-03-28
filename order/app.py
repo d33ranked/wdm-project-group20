@@ -6,9 +6,7 @@ import os
 import tpc
 import json
 import time
-import uuid
 import saga
-import random
 import logging
 import threading
 from db import get_order
@@ -20,6 +18,7 @@ from common.redis_db import (
     setup_gunicorn_logging,
 )
 from common.streams import create_bus_pool
+from operations import create_order, batch_init_orders, add_item_to_order
 
 TRANSACTION_MODE = os.environ.get("TRANSACTION_MODE", "TPC")
 STOCK_SERVICE_URL = os.environ.get("STOCK_SERVICE_URL", "http://stock-service:5000")
@@ -43,44 +42,14 @@ def _log_request_time(response):
 
 
 @app.post("/create/<user_id>")
-def create_order(user_id: str):
-    order_id = str(uuid.uuid4())
-    g.redis.hset(
-        f"order:{order_id}",
-        mapping={
-            "paid": "false",
-            "items": json.dumps([]),
-            "user_id": user_id,
-            "total_cost": "0",
-        },
-    )
+def create_order_route(user_id: str):
+    order_id = create_order(g.redis, user_id)
     return jsonify({"order_id": order_id}), 201
 
 
 @app.post("/batch_init/<n>/<n_items>/<n_users>/<item_price>")
 def batch_init(n: int, n_items: int, n_users: int, item_price: int):
-    n, n_items, n_users, item_price = (
-        int(n),
-        int(n_items),
-        int(n_users),
-        int(item_price),
-    )
-
-    pipe = g.redis.pipeline(transaction=False)
-    for i in range(n):
-        uid = str(random.randint(0, n_users - 1))
-        i1 = str(random.randint(0, n_items - 1))
-        i2 = str(random.randint(0, n_items - 1))
-        pipe.hset(
-            f"order:{i}",
-            mapping={
-                "paid": "false",
-                "items": json.dumps([[i1, 1], [i2, 1]]),
-                "user_id": uid,
-                "total_cost": str(2 * item_price),
-            },
-        )
-    pipe.execute()
+    batch_init_orders(g.redis, int(n), int(n_items), int(n_users), int(item_price))
     return jsonify({"msg": "Batch init for orders successful"})
 
 
@@ -117,30 +86,9 @@ def add_item(order_id: str, item_id: str, quantity: int):
         abort(400, f"Item: {item_id} does not exist!")
     item_price = stock_reply.json()["price"]
 
-    order_data = g.redis.hgetall(f"order:{order_id}")
-    if not order_data:
-        abort(400, f"Order: {order_id} not found!")
-
-    items_list = json.loads(order_data.get("items", "[]"))
-    total_cost = int(order_data.get("total_cost", 0))
-
-    merged = False
-    for entry in items_list:
-        if entry[0] == item_id:
-            entry[1] += quantity
-            merged = True
-            break
-    if not merged:
-        items_list.append([item_id, quantity])
-    total_cost += quantity * item_price
-
-    g.redis.hset(
-        f"order:{order_id}",
-        mapping={
-            "items": json.dumps(items_list),
-            "total_cost": str(total_cost),
-        },
-    )
+    total_cost, error = add_item_to_order(g.redis, order_id, item_id, quantity, item_price)
+    if error:
+        abort(400, error)
 
     body = f"Item: {item_id} added to: {order_id} price updated to: {total_cost}"
     save_idempotency(g.redis, idem_key, 200, body)

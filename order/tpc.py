@@ -8,8 +8,9 @@ import redis as redis_lib
 from time import perf_counter
 from collections import defaultdict
 from flask import g, abort, Response
-from common.streams import get_bus, ensure_groups, publish
 from common.orchestrator import Orchestrator, Workflow, StepFailed
+from common.stream_rpc import StreamRpc
+from common.streams import get_bus, ensure_groups, publish
 
 logger = logging.getLogger(__name__)
 
@@ -28,35 +29,11 @@ class TpcStreamClient:
 
     def __init__(self, bus_pool):
         self._pool = bus_pool
-        self._pending: dict = {}
-        self._pending_lock = threading.Lock()
+        self._rpc = StreamRpc(default_timeout=TPC_TIMEOUT_S)
         self._start_response_consumer()
 
     def send(self, stream: str, payload: dict, correlation_id: str) -> dict:
-        event = threading.Event()
-        with self._pending_lock:
-            self._pending[correlation_id] = (event, None)
-
-        bus = get_bus(self._pool)
-        try:
-            publish(bus, stream, payload)
-        except Exception as exc:
-            self._remove_pending(correlation_id)
-            logger.error("Failed to publish TPC command to '%s': %s", stream, exc)
-            return {"status_code": 400, "body": f"Bus publish error: {exc}"}
-
-        if not event.wait(timeout=TPC_TIMEOUT_S):
-            self._remove_pending(correlation_id)
-            logger.warning("TPC timeout waiting for response to %s", correlation_id)
-            return {"status_code": 400, "body": "TPC request timed out"}
-
-        with self._pending_lock:
-            _, response = self._pending.pop(correlation_id)
-        return response
-
-    def _remove_pending(self, correlation_id: str):
-        with self._pending_lock:
-            self._pending.pop(correlation_id, None)
+        return self._rpc.send(self._pool, stream, payload, correlation_id)
 
     def _start_response_consumer(self):
         def consume():
@@ -75,7 +52,10 @@ class TpcStreamClient:
                         for msg_id, fields in entries:
                             last_id = msg_id
                             try:
-                                self._handle_response(json.loads(fields["data"]))
+                                payload = json.loads(fields["data"])
+                                corr_id = payload.get("correlation_id", "")
+                                if corr_id:
+                                    self._rpc.handle_response(corr_id, payload)
                             except (KeyError, json.JSONDecodeError) as exc:
                                 logger.error(
                                     "Malformed TPC response %s: %s", msg_id, exc
@@ -87,18 +67,6 @@ class TpcStreamClient:
         threading.Thread(
             target=consume, daemon=True, name="tpc-response-consumer"
         ).start()
-
-    def _handle_response(self, payload: dict):
-        correlation_id = payload.get("correlation_id")
-        if not correlation_id:
-            return
-        with self._pending_lock:
-            entry = self._pending.get(correlation_id)
-            if entry is None:
-                return
-            event, _ = entry
-            self._pending[correlation_id] = (event, payload)
-        event.set()
 
 
 def init_bus(bus_pool, redis_pool):

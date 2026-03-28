@@ -1,22 +1,22 @@
 import json
-import uuid
+import uuid  # still used by _fetch_item_price corr_id
 import time
-import random
 import logging
 import threading
 import redis as redis_lib
 from collections import defaultdict
 from db import get_order, get_order_for_update, mark_paid
 from common.idempotency import check_idempotency, save_idempotency
-from common.orchestrator import Orchestrator, Workflow, StepFailed, suspend
+from common.orchestrator import Orchestrator, Workflow, suspend
 from common.streams import (
-    create_bus_pool,
     get_bus,
     ensure_groups,
     publish,
+    publish_response,
     read_pending_then_new,
     ack,
 )
+from operations import create_order, batch_init_orders, add_item_to_order
 
 logger = logging.getLogger(__name__)
 
@@ -62,15 +62,7 @@ def _get_bus():
 
 
 def _publish_gateway_response(correlation_id: str, status_code: int, body):
-    publish(
-        _get_bus(),
-        GATEWAY_RESPONSE_STREAM,
-        {
-            "correlation_id": correlation_id,
-            "status_code": status_code,
-            "body": body,
-        },
-    )
+    publish_response(_get_bus(), GATEWAY_RESPONSE_STREAM, correlation_id, status_code, body)
 
 
 def _publish_internal_request(
@@ -247,40 +239,11 @@ def route_gateway_message(payload, r):
     idem_key = headers.get("Idempotency-Key") or headers.get("idempotency-key")
 
     if method == "POST" and len(segments) >= 2 and segments[0] == "create":
-        order_id = str(uuid.uuid4())
-        r.hset(
-            f"order:{order_id}",
-            mapping={
-                "paid": "false",
-                "items": json.dumps([]),
-                "user_id": segments[1],
-                "total_cost": "0",
-            },
-        )
+        order_id = create_order(r, segments[1])
         return 201, {"order_id": order_id}
 
     if method == "POST" and len(segments) >= 5 and segments[0] == "batch_init":
-        n, n_items, n_users, item_price = (
-            int(segments[1]),
-            int(segments[2]),
-            int(segments[3]),
-            int(segments[4]),
-        )
-        pipe = r.pipeline(transaction=False)
-        for i in range(n):
-            uid = str(random.randint(0, n_users - 1))
-            i1 = str(random.randint(0, n_items - 1))
-            i2 = str(random.randint(0, n_items - 1))
-            pipe.hset(
-                f"order:{i}",
-                mapping={
-                    "paid": "false",
-                    "items": json.dumps([[i1, 1], [i2, 1]]),
-                    "user_id": uid,
-                    "total_cost": str(2 * item_price),
-                },
-            )
-        pipe.execute()
+        batch_init_orders(r, int(segments[1]), int(segments[2]), int(segments[3]), int(segments[4]))
         return 200, {"msg": "Batch init for orders successful"}
 
     if method == "GET" and len(segments) >= 2 and segments[0] == "find":
@@ -311,30 +274,9 @@ def route_gateway_message(payload, r):
             return 400, {"error": f"Item {item_id} not found in stock service"}
         item_price = stock_response["body"]["price"]
 
-        order_data = r.hgetall(f"order:{order_id}")
-        if not order_data:
-            return 400, {"error": f"Order {order_id} not found"}
-
-        items_list = json.loads(order_data.get("items", "[]"))
-        total_cost = int(order_data.get("total_cost", 0))
-
-        merged = False
-        for entry in items_list:
-            if entry[0] == item_id:
-                entry[1] += quantity
-                merged = True
-                break
-        if not merged:
-            items_list.append([item_id, quantity])
-        total_cost += quantity * item_price
-
-        r.hset(
-            f"order:{order_id}",
-            mapping={
-                "items": json.dumps(items_list),
-                "total_cost": str(total_cost),
-            },
-        )
+        total_cost, error = add_item_to_order(r, order_id, item_id, quantity, item_price)
+        if error:
+            return 400, {"error": error}
         resp = f"Item: {item_id} added to: {order_id} price updated to: {total_cost}"
         save_idempotency(r, idem_key, 200, resp)
         return 200, resp

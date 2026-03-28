@@ -1,5 +1,3 @@
-# stock saga participant — redis streams, at-least-once delivery via pending re-read
-
 import json
 import uuid
 import time
@@ -11,9 +9,9 @@ from common.idempotency import check_idempotency, save_idempotency
 from common.streams import (
     get_bus,
     ensure_groups,
-    publish,
-    read_pending_then_new,
-    ack,
+    publish_response,
+    make_message_handler,
+    run_gevent_consumer,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,7 +53,6 @@ def _get_bus():
 
 
 def db_subtract_stock_batch(r, items):
-    # all-or-nothing lua: checks all items have sufficient stock before deducting any
     keys = [f"item:{item_id}" for item_id, _ in items]
     args = [qty for _, qty in items]
     _scripts.deduct_stock_batch(keys=keys, args=args, client=r)
@@ -70,7 +67,6 @@ def db_subtract_stock_batch(r, items):
 
 
 def db_add_stock_batch(r, items):
-    # restore stock atomically; always succeeds
     keys = [f"item:{item_id}" for item_id, _ in items]
     args = [qty for _, qty in items]
     _scripts.restore_stock_batch(keys=keys, args=args, client=r)
@@ -85,7 +81,6 @@ def db_add_stock_batch(r, items):
 
 
 def route_stream_message(payload, r):
-    # dispatch inbound stream message; returns (status_code, body)
     method = payload.get("method", "GET").upper()
     path = payload.get("path", "/")
     body = payload.get("body") or {}
@@ -93,7 +88,6 @@ def route_stream_message(payload, r):
     segments = [s for s in path.strip("/").split("/") if s]
     idem_key = headers.get("Idempotency-Key") or headers.get("idempotency-key")
 
-    # POST /item/create/<price>
     if (
         method == "POST"
         and len(segments) >= 2
@@ -105,7 +99,6 @@ def route_stream_message(payload, r):
         r.hset(f"item:{item_id}", mapping={"stock": "0", "price": str(price)})
         return 201, {"item_id": item_id}
 
-    # POST /batch_init/<n>/<starting_stock>/<item_price>
     if method == "POST" and len(segments) >= 4 and segments[0] == "batch_init":
         n, starting_stock, item_price = (
             int(segments[1]),
@@ -121,7 +114,6 @@ def route_stream_message(payload, r):
         pipe.execute()
         return 200, {"msg": "Batch init for stock successful"}
 
-    # GET /find/<item_id>
     if method == "GET" and len(segments) >= 2 and segments[0] == "find":
         item_id = segments[1]
         data = r.hgetall(f"item:{item_id}")
@@ -129,7 +121,6 @@ def route_stream_message(payload, r):
             return 400, {"error": f"Item {item_id} not found"}
         return 200, {"stock": int(data["stock"]), "price": int(data["price"])}
 
-    # POST /add/<item_id>/<amount>
     if method == "POST" and len(segments) >= 3 and segments[0] == "add":
         item_id, amount = segments[1], int(segments[2])
         if amount <= 0:
@@ -144,7 +135,6 @@ def route_stream_message(payload, r):
         save_idempotency(r, idem_key, 200, resp)
         return 200, resp
 
-    # POST /subtract/<item_id>/<amount>
     if method == "POST" and len(segments) >= 3 and segments[0] == "subtract":
         item_id, amount = segments[1], int(segments[2])
         if amount <= 0:
@@ -168,7 +158,6 @@ def route_stream_message(payload, r):
         save_idempotency(r, idem_key, 200, resp)
         return 200, resp
 
-    # POST /subtract_batch
     if method == "POST" and segments and segments[0] == "subtract_batch":
         cached = check_idempotency(r, idem_key)
         if cached:
@@ -194,7 +183,6 @@ def route_stream_message(payload, r):
                 return 400, {"error": f"Item {item_id} has insufficient stock"}
             return 400, {"error": str(exc)}
 
-    # POST /add_batch
     if method == "POST" and segments and segments[0] == "add_batch":
         cached = check_idempotency(r, idem_key)
         if cached:
@@ -216,89 +204,23 @@ def route_stream_message(payload, r):
     return 404, {"error": f"No handler for {method} {path}"}
 
 
-def _publish_response(
-    response_stream: str, correlation_id: str, status_code: int, body
-):
-    publish(
-        _get_bus(),
-        response_stream,
-        {
-            "correlation_id": correlation_id,
-            "status_code": status_code,
-            "body": body,
-        },
-    )
-
-
-def _handle_gateway_message(msg_id: str, payload: dict):
-    # runs in its own greenlet — all messages in a batch execute concurrently
-    # gevent yields on every redis i/o call so 500 messages overlap their network waits
-    correlation_id = payload.get("correlation_id")
-    bus = _get_bus()
-    if not correlation_id:
-        ack(bus, GATEWAY_STREAM, GROUP_GATEWAY, msg_id)
-        return
-    r = _get_r()
-    try:
-        status_code, body = route_stream_message(payload, r)
-    except Exception as exc:
-        logger.error("Error processing %s: %s", correlation_id, exc, exc_info=True)
-        status_code, body = 400, {"error": "Internal server error"}
-    _publish_response(GATEWAY_RESPONSE_STREAM, correlation_id, status_code, body)
-    ack(bus, GATEWAY_STREAM, GROUP_GATEWAY, msg_id)
-
-
-def _handle_internal_message(msg_id: str, payload: dict):
-    # runs in its own greenlet — same concurrent pattern as gateway handler
-    correlation_id = payload.get("correlation_id")
-    bus = _get_bus()
-    if not correlation_id:
-        ack(bus, INTERNAL_STREAM, GROUP_INTERNAL, msg_id)
-        return
-    r = _get_r()
-    try:
-        status_code, body = route_stream_message(payload, r)
-    except Exception as exc:
-        logger.error("Error processing %s: %s", correlation_id, exc, exc_info=True)
-        status_code, body = 400, {"error": "Internal server error"}
-    _publish_response(INTERNAL_RESPONSE_STREAM, correlation_id, status_code, body)
-    ack(bus, INTERNAL_STREAM, GROUP_INTERNAL, msg_id)
+_handle_gateway_message = make_message_handler(
+    _get_bus, _get_r, GATEWAY_STREAM, GROUP_GATEWAY, GATEWAY_RESPONSE_STREAM, route_stream_message
+)
+_handle_internal_message = make_message_handler(
+    _get_bus, _get_r, INTERNAL_STREAM, GROUP_INTERNAL, INTERNAL_RESPONSE_STREAM, route_stream_message
+)
 
 
 def start_gateway_consumer():
-    # consume gateway.stock; spawn one greenlet per message so the batch runs concurrently
-    import gevent
-    logger.info("Stock gateway consumer started on stream '%s'", GATEWAY_STREAM)
-    while True:
-        try:
-            msgs = read_pending_then_new(get_bus(_bus_pool), GATEWAY_STREAM, GROUP_GATEWAY)
-            if msgs:
-                gevent.joinall(
-                    [gevent.spawn(_handle_gateway_message, mid, pl) for mid, pl in msgs]
-                )
-        except Exception as exc:
-            logger.error("Stock gateway consumer error, retrying in 1s: %s", exc)
-            time.sleep(1)
+    run_gevent_consumer(_bus_pool, GATEWAY_STREAM, GROUP_GATEWAY, _handle_gateway_message, "Stock gateway")
 
 
 def start_internal_consumer():
-    # consume internal.stock; same concurrent pattern as gateway consumer
-    import gevent
-    logger.info("Stock internal consumer started on stream '%s'", INTERNAL_STREAM)
-    while True:
-        try:
-            msgs = read_pending_then_new(get_bus(_bus_pool), INTERNAL_STREAM, GROUP_INTERNAL)
-            if msgs:
-                gevent.joinall(
-                    [gevent.spawn(_handle_internal_message, mid, pl) for mid, pl in msgs]
-                )
-        except Exception as exc:
-            logger.error("Stock internal consumer error, retrying in 1s: %s", exc)
-            time.sleep(1)
+    run_gevent_consumer(_bus_pool, INTERNAL_STREAM, GROUP_INTERNAL, _handle_internal_message, "Stock internal")
 
 
 def recovery_saga(redis_pool):
-    # participant only — orchestrator (order service) drives recovery
     print(
         "SAGA RECOVERY STOCK: participant only — no saga state to recover", flush=True
     )
