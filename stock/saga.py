@@ -230,67 +230,68 @@ def _publish_response(
     )
 
 
+def _handle_gateway_message(msg_id: str, payload: dict):
+    # runs in its own greenlet — all messages in a batch execute concurrently
+    # gevent yields on every redis i/o call so 500 messages overlap their network waits
+    correlation_id = payload.get("correlation_id")
+    bus = _get_bus()
+    if not correlation_id:
+        ack(bus, GATEWAY_STREAM, GROUP_GATEWAY, msg_id)
+        return
+    r = _get_r()
+    try:
+        status_code, body = route_stream_message(payload, r)
+    except Exception as exc:
+        logger.error("Error processing %s: %s", correlation_id, exc, exc_info=True)
+        status_code, body = 400, {"error": "Internal server error"}
+    _publish_response(GATEWAY_RESPONSE_STREAM, correlation_id, status_code, body)
+    ack(bus, GATEWAY_STREAM, GROUP_GATEWAY, msg_id)
+
+
+def _handle_internal_message(msg_id: str, payload: dict):
+    # runs in its own greenlet — same concurrent pattern as gateway handler
+    correlation_id = payload.get("correlation_id")
+    bus = _get_bus()
+    if not correlation_id:
+        ack(bus, INTERNAL_STREAM, GROUP_INTERNAL, msg_id)
+        return
+    r = _get_r()
+    try:
+        status_code, body = route_stream_message(payload, r)
+    except Exception as exc:
+        logger.error("Error processing %s: %s", correlation_id, exc, exc_info=True)
+        status_code, body = 400, {"error": "Internal server error"}
+    _publish_response(INTERNAL_RESPONSE_STREAM, correlation_id, status_code, body)
+    ack(bus, INTERNAL_STREAM, GROUP_INTERNAL, msg_id)
+
+
 def start_gateway_consumer():
-    # consume gateway.stock; ack after response published for at-least-once delivery
+    # consume gateway.stock; spawn one greenlet per message so the batch runs concurrently
+    import gevent
     logger.info("Stock gateway consumer started on stream '%s'", GATEWAY_STREAM)
     while True:
         try:
-            bus = _get_bus()
-            for msg_id, payload in read_pending_then_new(
-                bus, GATEWAY_STREAM, GROUP_GATEWAY
-            ):
-                correlation_id = payload.get("correlation_id")
-                if not correlation_id:
-                    ack(bus, GATEWAY_STREAM, GROUP_GATEWAY, msg_id)
-                    continue
-
-                r = _get_r()
-                try:
-                    status_code, body = route_stream_message(payload, r)
-                except Exception as exc:
-                    logger.error(
-                        "Error processing %s: %s", correlation_id, exc, exc_info=True
-                    )
-                    status_code, body = 400, {"error": "Internal server error"}
-
-                _publish_response(
-                    GATEWAY_RESPONSE_STREAM, correlation_id, status_code, body
+            msgs = read_pending_then_new(get_bus(_bus_pool), GATEWAY_STREAM, GROUP_GATEWAY)
+            if msgs:
+                gevent.joinall(
+                    [gevent.spawn(_handle_gateway_message, mid, pl) for mid, pl in msgs]
                 )
-                ack(bus, GATEWAY_STREAM, GROUP_GATEWAY, msg_id)
-
         except Exception as exc:
             logger.error("Stock gateway consumer error, retrying in 1s: %s", exc)
             time.sleep(1)
 
 
 def start_internal_consumer():
-    # consume internal.stock; same at-least-once contract as gateway consumer
+    # consume internal.stock; same concurrent pattern as gateway consumer
+    import gevent
     logger.info("Stock internal consumer started on stream '%s'", INTERNAL_STREAM)
     while True:
         try:
-            bus = _get_bus()
-            for msg_id, payload in read_pending_then_new(
-                bus, INTERNAL_STREAM, GROUP_INTERNAL
-            ):
-                correlation_id = payload.get("correlation_id")
-                if not correlation_id:
-                    ack(bus, INTERNAL_STREAM, GROUP_INTERNAL, msg_id)
-                    continue
-
-                r = _get_r()
-                try:
-                    status_code, body = route_stream_message(payload, r)
-                except Exception as exc:
-                    logger.error(
-                        "Error processing %s: %s", correlation_id, exc, exc_info=True
-                    )
-                    status_code, body = 400, {"error": "Internal server error"}
-
-                _publish_response(
-                    INTERNAL_RESPONSE_STREAM, correlation_id, status_code, body
+            msgs = read_pending_then_new(get_bus(_bus_pool), INTERNAL_STREAM, GROUP_INTERNAL)
+            if msgs:
+                gevent.joinall(
+                    [gevent.spawn(_handle_internal_message, mid, pl) for mid, pl in msgs]
                 )
-                ack(bus, INTERNAL_STREAM, GROUP_INTERNAL, msg_id)
-
         except Exception as exc:
             logger.error("Stock internal consumer error, retrying in 1s: %s", exc)
             time.sleep(1)
