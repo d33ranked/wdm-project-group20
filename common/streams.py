@@ -9,9 +9,8 @@ import redis as redis_lib
 logger = logging.getLogger(__name__)
 
 BLOCK_MS = 2_000  # blocking xreadgroup timeout per iteration
-CONSUMER_NAME = (
-    "worker"  # single worker per service; all pending entries owned by same name
-)
+import os as _os
+CONSUMER_NAME = f"worker-{_os.getpid()}"  # unique per process so pending re-delivery is per-worker
 
 
 def create_bus_pool() -> redis_lib.ConnectionPool:
@@ -21,7 +20,7 @@ def create_bus_pool() -> redis_lib.ConnectionPool:
     pool = redis_lib.ConnectionPool(
         host=host,
         port=port,
-        max_connections=20,
+        max_connections=1200,
         decode_responses=True,
         socket_keepalive=True,
         socket_connect_timeout=2,

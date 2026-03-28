@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 
 # create a connection pool
 def create_redis_pool(service_name: str) -> redis.ConnectionPool:
-    # max_connections=100 : each greenlet counts as one, so 100 is enough for a single-worker process
+    # max_connections=1200 : under 1000 concurrent greenlets each Redis command borrows a connection
+    # briefly; 1200 gives headroom above the benchmark's 1000-user concurrency level
     # decode_responses=True : automatically decode byte responses to strings for the client
     # socket_keepalive=True : keeps idle sockets alive
 
@@ -30,7 +31,7 @@ def create_redis_pool(service_name: str) -> redis.ConnectionPool:
     pool = redis.ConnectionPool(
         host=host,
         port=port,
-        max_connections=100,
+        max_connections=1200,
         decode_responses=True,
         socket_keepalive=True,
         socket_connect_timeout=2,
