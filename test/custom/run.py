@@ -1,80 +1,36 @@
 #!/usr/bin/env python3
-"""
-Test Suite Runner
-=================
-Single entry point for all custom tests.
+# test runner — single command, no prompts
+# usage: python run.py [--mode TPC|SAGA] [--skip-build] [--no-restart]
 
-- Asks for TRANSACTION_MODE (TPC or SAGA)
-- Updates docker-compose.yml with the chosen mode
-- Tears down, rebuilds, and starts all containers
-- Waits for services to become healthy
-- Runs the appropriate test modules; user presses Enter between test cases
-"""
-
+import argparse
 import importlib
 import os
-import re
 import subprocess
 import sys
 import time
 
 import requests
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
-COMPOSE_FILE = os.path.join(PROJECT_ROOT, "docker-compose.yml")
 
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-# When this file runs as __main__, Python creates a separate "run" module
-# on import from test files. Alias __main__ → run so both share one namespace.
+# alias __main__ → run so sibling modules share this namespace when imported
 if __name__ == "__main__":
     sys.modules["run"] = sys.modules["__main__"]
 
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
+MODE     = "TPC"   # set by main() before any suite runs
 
-# ---------------------------------------------------------------------------
-# Shared test harness — imported by test_common, test_tpc, test_sagas
-# ---------------------------------------------------------------------------
+# --- ansi colours ---
+_BLUE  = "\033[94m"
+_GREEN = "\033[92m"
+_RED   = "\033[91m"
+_RESET = "\033[0m"
 
-# ---------------------------------------------------------------------------
-# Docker helpers (shared by test_tpc and test_sagas)
-# ---------------------------------------------------------------------------
-
-def docker_cmd(cmd: str):
-    """Run a docker command silently."""
-    subprocess.run(
-        cmd, shell=True, cwd=PROJECT_ROOT,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-
-
-def docker_exec_redis(container: str, *cmd_args):
-    """Execute a redis-cli command inside a redis container.
-    Each element of cmd_args is passed as a separate argument so JSON
-    values with special characters are never misinterpreted by a shell."""
-    subprocess.run(
-        ["docker", "exec", container, "redis-cli"] + list(cmd_args),
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-
-
-def wait_for_service(probe_path: str, timeout: int = 60):
-    """Poll until a service endpoint responds with a non-5xx status."""
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            r = requests.get(f"{BASE_URL}{probe_path}", timeout=3)
-            if r.status_code < 500:
-                return True
-        except Exception:
-            pass
-        time.sleep(2)
-    return False
+# --- pass/fail counters ---
 _pass_count = 0
 _fail_count = 0
 
@@ -90,13 +46,13 @@ def get_counts():
 
 
 def check(description: str, condition: bool, detail: str = ""):
-    """Assert a single test expectation and print result."""
+    # assert one expectation and print pass/fail
     global _pass_count, _fail_count
     if condition:
-        print(f"    \033[92m[PASS]\033[0m {description}")
+        print(f"      {_GREEN}[PASS]{_RESET} {description}")
         _pass_count += 1
     else:
-        msg = f"    \033[91m[FAIL]\033[0m {description}"
+        msg = f"      {_RED}[FAIL]{_RESET} {description}"
         if detail:
             msg += f"  ({detail})"
         print(msg)
@@ -104,80 +60,87 @@ def check(description: str, condition: bool, detail: str = ""):
 
 
 def api(method: str, path: str, **kwargs):
-    """Fire an HTTP request against the gateway. Returns the Response object."""
-    url = f"{BASE_URL}{path}"
-    return requests.request(method, url, timeout=30, **kwargs)
+    # fire http request against gateway; returns Response
+    return requests.request(method, f"{BASE_URL}{path}", timeout=30, **kwargs)
 
 
 def json_field(response, key):
-    """Safely extract a JSON field from a response."""
+    # safely extract json field from response
     return response.json().get(key)
 
 
-# ---------------------------------------------------------------------------
-# Docker helpers
-# ---------------------------------------------------------------------------
-def _run(cmd: str, cwd: str = PROJECT_ROOT, check_rc: bool = True):
-    """Run a shell command, streaming output."""
+def docker_cmd(cmd: str):
+    # run docker command silently
+    subprocess.run(
+        cmd, shell=True, cwd=PROJECT_ROOT,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def docker_exec_redis(container: str, *cmd_args):
+    # execute redis-cli inside container; args passed directly, no shell splitting
+    subprocess.run(
+        ["docker", "exec", container, "redis-cli"] + list(cmd_args),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def wait_for_service(probe_path: str, timeout: int = 60):
+    # poll until endpoint returns non-5xx
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            r = requests.get(f"{BASE_URL}{probe_path}", timeout=3)
+            if r.status_code < 500:
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+
+# --- docker stack ---
+
+def _compose_env(mode: str) -> dict:
+    # build subprocess env with mode-specific vars, inheriting host env
+    env = os.environ.copy()
+    env["TRANSACTION_MODE"] = mode
+    env["NGINX_CONF"] = "gateway_nginx_saga.conf" if mode == "SAGA" else "gateway_nginx.conf"
+    return env
+
+
+def _run(cmd: str, env: dict | None = None):
+    # run shell command streaming stdout; exit on failure
     print(f"  $ {cmd}")
     result = subprocess.run(
-        cmd,
-        shell=True,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+        cmd, shell=True, cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, env=env,
     )
     if result.stdout.strip():
         for line in result.stdout.strip().splitlines():
             print(f"    {line}")
-    if check_rc and result.returncode != 0:
-        print(f"\n  Command failed with exit code {result.returncode}")
+    if result.returncode != 0:
+        print(f"\n  command failed (exit {result.returncode})")
         sys.exit(1)
     return result
 
 
-def set_transaction_mode(mode: str):
-    """Patch TRANSACTION_MODE and nginx config in docker-compose.yml."""
-    with open(COMPOSE_FILE, "r") as f:
-        content = f.read()
-    # Update TRANSACTION_MODE env var across all services
-    updated = re.sub(
-        r"(TRANSACTION_MODE=)\w+",
-        rf"\g<1>{mode}",
-        content,
-    )
-    # Swap nginx config file mount: TPC uses gateway_nginx.conf, SAGA uses gateway_nginx_saga.conf
-    if mode == "SAGA":
-        updated = updated.replace(
-            "./gateway_nginx.conf:/etc/nginx/nginx.conf:ro",
-            "./gateway_nginx_saga.conf:/etc/nginx/nginx.conf:ro",
-        )
-    else:
-        updated = updated.replace(
-            "./gateway_nginx_saga.conf:/etc/nginx/nginx.conf:ro",
-            "./gateway_nginx.conf:/etc/nginx/nginx.conf:ro",
-        )
-    with open(COMPOSE_FILE, "w") as f:
-        f.write(updated)
-    print(f"  Docker Compose Updated! Transaction Mode: {mode}")
-
-
-def docker_clean_and_start():
-    """Tear down, rebuild, and start all containers."""
-    sep = "=" * LINE_WIDTH
-    print("\n" + sep)
-    print("  Docker Compose Clean & Start")
-    print(sep)
-    _run("docker compose down -v --remove-orphans")
-    _run("docker compose build --quiet")
-    _run("docker compose up -d")
+def start_stack(mode: str, skip_build: bool = False, no_restart: bool = False):
+    # bring stack up in correct mode; optionally skip rebuild or full restart
+    env = _compose_env(mode)
+    print(f"\n  Stack  Mode={mode}  SkipBuild={skip_build}  NoRestart={no_restart}\n")
+    if not no_restart:
+        _run("docker compose down -v --remove-orphans", env=env)
+    if not skip_build:
+        _run("docker compose build --quiet", env=env)
+    _run("docker compose up -d", env=env)
     print()
 
 
 def wait_for_services(timeout: int = 90):
-    """Poll the gateway until all three services respond."""
-    print("  Waiting for Services to Become Healthy...")
+    # poll gateway until all three services respond
+    print("  Waiting For Services...")
     endpoints = [
         "/stock/item/create/1",
         "/payment/create_user",
@@ -191,66 +154,40 @@ def wait_for_services(timeout: int = 90):
                 for ep in endpoints
             )
             if ok:
-                print("  All Services Are Up.\n")
+                print("  Services Ready\n")
                 return
         except requests.RequestException:
             pass
         time.sleep(3)
-    print("  Timed Out Waiting for Services.")
+    print("  Timed Out Waiting For Services")
     sys.exit(1)
 
 
-# ---------------------------------------------------------------------------
-# Pause between tests
-# ---------------------------------------------------------------------------
-LINE_WIDTH = 60
+# --- test runner ---
 
+def run_suite(label: str, module_name: str) -> tuple[int, int]:
+    # import module, run all TESTS entries without prompts; TESTS is (container, name, func)
+    mod   = importlib.import_module(module_name)
+    tests = getattr(mod, "TESTS", [])
 
-def wait_for_enter():
-    """Pause until the user presses Enter before the next test."""
-    input("\n  Press Enter to run the next test... ")
-
-
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
-def collect_tests(module_name: str):
-    """Import a sibling module and return its ordered test functions."""
-    mod = importlib.import_module(module_name)
-    return getattr(mod, "TESTS", [])
-
-
-def run_suite(label: str, tests: list):
-    """Run a list of (name, func) test pairs; user presses Enter between them."""
-    global _fail_count
     if not tests:
-        sep = "=" * LINE_WIDTH
-        print(f"\n{sep}")
-        print(f"  {label}: no tests defined yet")
-        print(sep)
+        print(f"\n  {label}  (No Tests Defined)\n")
         return 0, 0
 
-    sep = "=" * LINE_WIDTH
-    dash = "-" * LINE_WIDTH
-    print(f"\n{sep}")
-    print(f"  {label}  ({len(tests)} Test Cases)")
-    print(sep)
+    print(f"\n  {label}  ({len(tests)} Cases)\n")
 
     case_pass = 0
     case_fail = 0
 
-    for idx, (name, func) in enumerate(tests):
-        if idx > 0:
-            wait_for_enter()
-
+    for idx, (container, name, func) in enumerate(tests):
         reset_counts()
-        print(f"\n  [{idx + 1}/{len(tests)}] {name}")
-        print(dash)
+        print(f"    [{idx+1}/{len(tests)}] {_BLUE}[{container}]{_RESET} {name}")
         try:
             func()
         except Exception as e:
-            print(f"    \033[91m[ERROR]\033[0m {e}")
+            print(f"      {_RED}[ERROR]{_RESET} {e}")
             _fail_count += 1
+        print()
 
         _, f = get_counts()
         if f == 0:
@@ -262,76 +199,43 @@ def run_suite(label: str, tests: list):
 
 
 def main():
-    sep = "=" * LINE_WIDTH
-    print()
-    print(sep)
-    print("  BENCHMARKING SUITE — GROUP 20")
-    print(sep)
+    parser = argparse.ArgumentParser(description="WDM group 24 test runner")
+    parser.add_argument("--mode", choices=["TPC", "SAGA"], default="TPC",
+                        help="transaction mode (default: TPC)")
+    parser.add_argument("--skip-build", action="store_true",
+                        help="skip docker compose build")
+    parser.add_argument("--no-restart", action="store_true",
+                        help="skip docker compose down/up (reuse running stack)")
+    args = parser.parse_args()
 
-    # --- Ask for mode ---
-    print()
-    mode = input("  Enter Transaction Mode (TPC / SAGA): ").strip().upper()
-    if mode not in ("TPC", "SAGA"):
-        print("  Invalid Input. Must explicitly be TPC or SAGA.")
-        sys.exit(1)
+    global MODE
+    MODE = args.mode
 
-    # --- Update compose and restart containers ---
-    set_transaction_mode(mode)
-    docker_clean_and_start()
+    print(f"\n  WDM Group 24  Mode={MODE}\n")
+
+    start_stack(MODE, skip_build=args.skip_build, no_restart=args.no_restart)
     wait_for_services()
 
-    # --- Collect tests ---
-    common_tests  = collect_tests("test_common")
-    phase1_tests  = collect_tests("test_phase1_redis")
-    mode_tests    = (
-        collect_tests("test_tpc") if mode == "TPC" else collect_tests("test_sagas")
-    )
-    phase2_tests  = [] if mode == "TPC" else collect_tests("test_phase2_streams")
-    mode_label    = "2PC (Two-Phase Commit)" if mode == "TPC" else "SAGA"
-
-    # --- Run ---
     total_pass, total_fail = 0, 0
 
-    p, f = run_suite("Common Test Suite", common_tests)
+    p, f = run_suite("Common", "test_common")
     total_pass += p
     total_fail += f
 
-    if common_tests and phase1_tests:
-        wait_for_enter()
-
-    p, f = run_suite("Phase 1 — Redis Storage Test Suite", phase1_tests)
-    total_pass += p
-    total_fail += f
-
-    if phase1_tests and mode_tests:
-        wait_for_enter()
-
-    p, f = run_suite(f"{mode_label} Test Suite", mode_tests)
-    total_pass += p
-    total_fail += f
-
-    if mode_tests and phase2_tests:
-        wait_for_enter()
-
-    p, f = run_suite("Phase 2 — Redis Streams Test Suite (SAGA Only)", phase2_tests)
-    total_pass += p
-    total_fail += f
-
-    # --- Final summary (counts are test cases, not granular checks) ---
-    total_cases = total_pass + total_fail
-    sep = "=" * LINE_WIDTH
-    print(f"\n{sep}")
-    print(f"  Final Summary")
-    print(sep)
-    print(f"    Mode:        {mode}")
-    print(f"    Test cases:  {total_cases}")
-    print(f"    Passed:      \033[92m{total_pass}\033[0m")
-    print(f"    Failed:      \033[91m{total_fail}\033[0m")
-    if total_fail == 0:
-        print(f"    Result:      \033[92mALL TESTS PASSED\033[0m")
+    if MODE == "TPC":
+        p, f = run_suite("2PC", "test_tpc")
     else:
-        print(f"    Result:      \033[91mSOME TESTS FAILED\033[0m")
-    print(sep + "\n")
+        p, f = run_suite("SAGA", "test_sagas")
+    total_pass += p
+    total_fail += f
+
+    total_cases  = total_pass + total_fail
+    result_label = f"{_GREEN}All Tests Passed{_RESET}" if total_fail == 0 \
+                   else f"{_RED}Some Tests Failed{_RESET}"
+
+    print(f"  Summary  Mode={MODE}  Cases={total_cases}  "
+          f"{_GREEN}Passed={total_pass}{_RESET}  {_RED}Failed={total_fail}{_RESET}")
+    print(f"  {result_label}\n")
 
     sys.exit(0 if total_fail == 0 else 1)
 

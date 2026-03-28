@@ -1,24 +1,15 @@
-"""
-2PC (Two-Phase Commit) Tests
-=============================
-Tests specific to the TPC transaction mode.
-Covers prepare/commit/abort correctness, resource locking during prepare,
-competing transactions, idempotent commit/abort, mixed-vote checkout scenarios,
-and coordinator/participant failure recovery.
-"""
+# 2pc tests — prepare/commit/abort correctness, locking, competing txns, idempotency, recovery
 
 import subprocess
-import threading
 import time
+import uuid
+import json
 
 from run import api, check, json_field, PROJECT_ROOT, docker_cmd, docker_exec_redis, wait_for_service
 
 
-# ---------------------------------------------------------------------------
-# 1. PREPARE → COMMIT Finalises Permanently (Stock And Payment)
-# ---------------------------------------------------------------------------
 def test_prepare_commit():
-    """Prepare reserves resources, commit makes the deduction permanent."""
+    # prepare reserves resources, commit makes the deduction permanent
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/10")
 
@@ -58,11 +49,8 @@ def test_prepare_commit():
           credit == 70, f"got {credit}")
 
 
-# ---------------------------------------------------------------------------
-# 2. PREPARE → ABORT Restores Fully (Stock And Payment)
-# ---------------------------------------------------------------------------
 def test_prepare_abort():
-    """Prepare reserves resources, abort returns everything."""
+    # prepare reserves resources, abort returns everything
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/10")
 
@@ -94,11 +82,8 @@ def test_prepare_abort():
           credit == 100, f"got {credit}")
 
 
-# ---------------------------------------------------------------------------
-# 3. Vote NO When Insufficient (Stock And Payment)
-# ---------------------------------------------------------------------------
 def test_vote_no():
-    """Prepare for more than available — service votes NO, nothing changes."""
+    # prepare for more than available — service votes NO, nothing changes
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/2")
 
@@ -122,11 +107,8 @@ def test_vote_no():
           credit == 10, f"got {credit}")
 
 
-# ---------------------------------------------------------------------------
-# 4. Prepared Resources Are Locked From Regular Operations
-# ---------------------------------------------------------------------------
 def test_prepare_locks_resources():
-    """PREPARE holds 8 of 10 stock; a regular subtract of 5 must fail because only 2 are free."""
+    # PREPARE holds 8 of 10 stock; a regular subtract of 5 must fail because only 2 are free
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/10")
 
@@ -146,11 +128,8 @@ def test_prepare_locks_resources():
     api("POST", "/stock/abort/txn-lock")
 
 
-# ---------------------------------------------------------------------------
-# 5. ABORT Frees Locked Resources For New Operations
-# ---------------------------------------------------------------------------
 def test_abort_frees_resources():
-    """PREPARE 8 of 10 → ABORT → subtract all 10 succeeds (everything freed)."""
+    # PREPARE 8 of 10 → ABORT → subtract all 10 succeeds (everything freed)
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/10")
 
@@ -170,11 +149,8 @@ def test_abort_frees_resources():
           stock == 0, f"got {stock}")
 
 
-# ---------------------------------------------------------------------------
-# 6. Competing PREPAREs On The Same Resource
-# ---------------------------------------------------------------------------
 def test_competing_prepares():
-    """Two transactions each try to reserve 7 from stock=10 — second must vote NO."""
+    # two transactions each try to reserve 7 from stock=10 — second must vote NO
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/10")
 
@@ -193,11 +169,8 @@ def test_competing_prepares():
     api("POST", "/stock/abort/txn-comp-a")
 
 
-# ---------------------------------------------------------------------------
-# 7. Idempotent COMMIT — Re-COMMIT Is A Safe No-Op
-# ---------------------------------------------------------------------------
 def test_idempotent_commit():
-    """COMMIT same txn twice — second is a no-op, no double deduction."""
+    # COMMIT same txn twice — second is a no-op, no double deduction
     item = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/10")
     api("POST", f"/stock/prepare/txn-idem-c/{item}/3")
@@ -225,11 +198,8 @@ def test_idempotent_commit():
           credit == 80, f"got {credit}")
 
 
-# ---------------------------------------------------------------------------
-# 8. ABORT Safety — Non-Existent And Already-Resolved Transactions
-# ---------------------------------------------------------------------------
 def test_abort_safety():
-    """ABORT on unknown txn and already-committed txn — both return 200, no state change."""
+    # ABORT on unknown txn and already-committed txn — both return 200, no state change
     r = api("POST", "/stock/abort/txn-never-existed")
     check("Stock: ABORT Of Non-Existent Transaction Returns 200 — Safe No-Op",
           r.status_code == 200)
@@ -252,19 +222,15 @@ def test_abort_safety():
           stock == 3, f"got {stock}")
 
 
-# ---------------------------------------------------------------------------
-# 9. 2PC Checkout — Stock Votes NO, Entire Checkout Aborts
-# ---------------------------------------------------------------------------
 def test_checkout_stock_votes_no():
-    """Stock cannot fulfil → coordinator aborts all → payment untouched."""
+    # stock cannot fulfil → coordinator aborts all → payment untouched
     CREDIT = 500
-    STOCK = 2
+    STOCK  = 2
 
-    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    user  = json_field(api("POST", "/payment/create_user"), "user_id")
     api("POST", f"/payment/add_funds/{user}/{CREDIT}")
-    item = json_field(api("POST", "/stock/item/create/10"), "item_id")
+    item  = json_field(api("POST", "/stock/item/create/10"), "item_id")
     api("POST", f"/stock/add/{item}/{STOCK}")
-
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/50")
 
@@ -281,20 +247,16 @@ def test_checkout_stock_votes_no():
           credit == CREDIT, f"got {credit}")
 
 
-# ---------------------------------------------------------------------------
-# 10. 2PC Checkout — Payment Votes NO, Stock Reservation Rolled Back
-# ---------------------------------------------------------------------------
 def test_checkout_payment_votes_no():
-    """Payment cannot fulfil → coordinator aborts → stock reservation reversed."""
-    PRICE = 100
-    STOCK = 10
+    # payment cannot fulfil → coordinator aborts → stock reservation reversed
+    PRICE  = 100
+    STOCK  = 10
     CREDIT = 5
 
-    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    user  = json_field(api("POST", "/payment/create_user"), "user_id")
     api("POST", f"/payment/add_funds/{user}/{CREDIT}")
-    item = json_field(api("POST", f"/stock/item/create/{PRICE}"), "item_id")
+    item  = json_field(api("POST", f"/stock/item/create/{PRICE}"), "item_id")
     api("POST", f"/stock/add/{item}/{STOCK}")
-
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/1")
 
@@ -311,20 +273,17 @@ def test_checkout_payment_votes_no():
           credit == CREDIT, f"got {credit}")
 
 
-# ---------------------------------------------------------------------------
-# 11. Participant Crash — Stock Service Dies During Checkout, Recovers
-# ---------------------------------------------------------------------------
 def test_participant_crash_recovery():
-    """Stop stock service, restart after 3s, checkout retries and succeeds."""
+    # stop stock service, restart after 3s, checkout retries and succeeds
     ITEM_PRICE = 10
-    ITEM_QTY = 2
-    STOCK = 5
-    CREDIT = 100
-    CONTAINER = "wdm-project-group24-stock-service-1"
+    ITEM_QTY   = 2
+    STOCK      = 5
+    CREDIT     = 100
+    CONTAINER  = "wdm-project-group24-stock-service-1"
 
-    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    user  = json_field(api("POST", "/payment/create_user"), "user_id")
     api("POST", f"/payment/add_funds/{user}/{CREDIT}")
-    item = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
+    item  = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
     api("POST", f"/stock/add/{item}/{STOCK}")
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
@@ -336,132 +295,100 @@ def test_participant_crash_recovery():
     )
 
     r = api("POST", f"/orders/checkout/{order}")
-    expected_stock = STOCK - ITEM_QTY
+    expected_stock  = STOCK - ITEM_QTY
     expected_credit = CREDIT - (ITEM_PRICE * ITEM_QTY)
 
     check("Checkout Completed After Stock Service Recovered — Order Service Retried Successfully",
           r.status_code == 200, f"got {r.status_code}")
 
     wait_for_service(f"/stock/find/{item}")
-    stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    stock  = json_field(api("GET", f"/stock/find/{item}"), "stock")
     credit = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
 
     check(f"Stock Decreased To {expected_stock} After Recovery — {ITEM_QTY} Units Sold",
           stock == expected_stock, f"got {stock}")
-    check(f"Credit Decreased To {expected_credit} After Recovery — "
-          f"Charged {ITEM_PRICE}×{ITEM_QTY}",
+    check(f"Credit Decreased To {expected_credit} After Recovery — Charged {ITEM_PRICE}x{ITEM_QTY}",
           credit == expected_credit, f"got {credit}")
 
 
-# ---------------------------------------------------------------------------
-# 12. Coordinator Crash — Injected Stuck Transaction, Recovery On Startup
-# ---------------------------------------------------------------------------
 def test_coordinator_crash_recovery():
-    """
-    Surgically inject a stuck transaction_log row (status='preparing_payment')
-    and a matching prepared_transaction in stock to simulate a coordinator crash
-    mid-checkout. Restart the order service and verify recovery resolves it
-    deterministically — no race-condition timing required.
-    """
-    import uuid
-    import json
-
-    ITEM_PRICE = 20
-    ITEM_QTY = 2
-    STOCK = 10
-    CREDIT = 200
+    # inject a stuck txn in preparing_payment, restart order service, verify recovery
+    ITEM_PRICE      = 20
+    ITEM_QTY        = 2
+    STOCK           = 10
+    CREDIT          = 200
     ORDER_CONTAINER = "wdm-project-group24-order-service-1"
-    ORDER_DB = "wdm-project-group24-redis-order-1"
-    STOCK_DB = "wdm-project-group24-redis-stock-1"
+    ORDER_DB        = "wdm-project-group24-redis-order-1"
+    STOCK_DB        = "wdm-project-group24-redis-stock-1"
 
-    # 1. Create resources via API
-    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    user  = json_field(api("POST", "/payment/create_user"), "user_id")
     api("POST", f"/payment/add_funds/{user}/{CREDIT}")
-    item = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
+    item  = json_field(api("POST", f"/stock/item/create/{ITEM_PRICE}"), "item_id")
     api("POST", f"/stock/add/{item}/{STOCK}")
     order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
     api("POST", f"/orders/addItem/{order}/{item}/{ITEM_QTY}")
 
-    txn_id = f"recovery-test-{uuid.uuid4()}"
-    # prepared_stock stored as [[item_id, quantity], ...] — matches order/tpc.py format
+    txn_id         = f"recovery-test-{uuid.uuid4()}"
     prepared_stock = json.dumps([[item, ITEM_QTY]])
 
-    # 2. Inject stuck state directly into Redis — simulates coordinator crashed
-    #    after stock PREPARE succeeded but before payment PREPARE was sent.
-    #
-    #    Stock Redis: deduct units (as PREPARE does via deduct_stock_batch Lua)
-    #    and write the reservation hash with TTL (as prepare_stock_batch Lua does).
     docker_exec_redis(STOCK_DB, "HINCRBY", f"item:{item}", "stock", str(-ITEM_QTY))
     docker_exec_redis(STOCK_DB, "HSET", f"prepared:stock:{txn_id}", item, str(ITEM_QTY))
     docker_exec_redis(STOCK_DB, "EXPIRE", f"prepared:stock:{txn_id}", "600")
-    #    Order Redis: write a txn:* hash stuck in 'preparing_payment'.
     docker_exec_redis(
         ORDER_DB,
         "HSET", f"txn:{txn_id}",
-        "order_id",       order,
-        "status",         "preparing_payment",
-        "prepared_stock", prepared_stock,
+        "order_id",         order,
+        "status",           "preparing_payment",
+        "prepared_stock",   prepared_stock,
         "prepared_payment", "false",
-        "user_id",        user,
-        "total_cost",     str(ITEM_PRICE * ITEM_QTY),
+        "user_id",          user,
+        "total_cost",       str(ITEM_PRICE * ITEM_QTY),
     )
 
     check(
-        "Stuck Transaction Injected Into DB — "
-        f"txn={txn_id[:8]}... status=preparing_payment, stock reduced by {ITEM_QTY}",
+        f"Stuck Transaction Injected — txn={txn_id[:8]}... status=preparing_payment",
         True,
     )
 
     stock_before = json_field(api("GET", f"/stock/find/{item}"), "stock")
     check(
         f"Stock Reads {STOCK - ITEM_QTY} After Injection — Confirms PREPARE Deduction Is Visible",
-        stock_before == STOCK - ITEM_QTY,
-        f"got {stock_before}",
+        stock_before == STOCK - ITEM_QTY, f"got {stock_before}",
     )
 
-    # 3. Restart the order service — recovery_tpc runs on startup.
     docker_cmd(f"docker restart {ORDER_CONTAINER}")
     wait_for_service(f"/orders/find/{order}", timeout=90)
     time.sleep(3)
 
-    # 4. Verify recovery resolved the stuck transaction.
-    #    status='preparing_payment' → recovery aborts (stock not committed yet,
-    #    payment never started) → stock returned, order NOT paid.
-    stock_after = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    stock_after  = json_field(api("GET", f"/stock/find/{item}"), "stock")
     credit_after = json_field(api("GET", f"/payment/find_user/{user}"), "credit")
-    paid_after = json_field(api("GET", f"/orders/find/{order}"), "paid")
+    paid_after   = json_field(api("GET", f"/orders/find/{order}"), "paid")
 
     check(
         f"Stock Restored To {STOCK} After Recovery — ABORT Returned The {ITEM_QTY} Reserved Units",
-        stock_after == STOCK,
-        f"got {stock_after}",
+        stock_after == STOCK, f"got {stock_after}",
     )
     check(
         f"Credit Unchanged At {CREDIT} — Payment Was Never Prepared, Nothing To Reverse",
-        credit_after == CREDIT,
-        f"got {credit_after}",
+        credit_after == CREDIT, f"got {credit_after}",
     )
     check(
         "Order NOT Marked Paid — Recovery Correctly Aborted The In-Doubt Transaction",
-        paid_after is not True,
-        f"got paid={paid_after}",
+        paid_after is not True, f"got paid={paid_after}",
     )
 
 
-# ---------------------------------------------------------------------------
-# Ordered test list — imported by run.py
-# ---------------------------------------------------------------------------
 TESTS = [
-    ("PREPARE → COMMIT On Stock And Payment", test_prepare_commit),
-    ("PREPARE → ABORT On Stock And Payment", test_prepare_abort),
-    ("Vote NO When Resources Are Insufficient", test_vote_no),
-    ("PREPARE Locks Resources From Regular Operations", test_prepare_locks_resources),
-    ("ABORT Releases Locked Resources For Reuse", test_abort_frees_resources),
-    ("Two Competing PREPAREs On The Same Stock", test_competing_prepares),
-    ("Idempotent COMMIT — No Double Deduction", test_idempotent_commit),
-    ("ABORT On Non-Existent And Already-Committed Transactions", test_abort_safety),
-    ("2PC Checkout: Stock Votes NO, Coordinator Aborts All", test_checkout_stock_votes_no),
-    ("2PC Checkout: Payment Votes NO, Stock Reservation Rolled Back", test_checkout_payment_votes_no),
-    ("Participant Crash: Stock Dies Mid-Checkout And Recovers", test_participant_crash_recovery),
-    ("Coordinator Crash: Order Service Killed After PREPARE, Recovers Consistently", test_coordinator_crash_recovery),
+    ("stock-service",  "PREPARE → COMMIT On Stock And Payment",                                        test_prepare_commit),
+    ("stock-service",  "PREPARE → ABORT On Stock And Payment",                                         test_prepare_abort),
+    ("stock-service",  "Vote NO When Resources Are Insufficient",                                       test_vote_no),
+    ("stock-service",  "PREPARE Locks Resources From Regular Operations",                               test_prepare_locks_resources),
+    ("stock-service",  "ABORT Releases Locked Resources For Reuse",                                    test_abort_frees_resources),
+    ("stock-service",  "Two Competing PREPAREs On The Same Stock",                                     test_competing_prepares),
+    ("stock-service",  "Idempotent COMMIT: No Double Deduction",                                       test_idempotent_commit),
+    ("stock-service",  "ABORT On Non-Existent And Already-Committed Transactions",                     test_abort_safety),
+    ("order-service",  "2PC Checkout: Stock Votes NO, Coordinator Aborts All",                         test_checkout_stock_votes_no),
+    ("order-service",  "2PC Checkout: Payment Votes NO, Stock Reservation Rolled Back",                test_checkout_payment_votes_no),
+    ("stock-service",  "Participant Crash: Stock Dies Mid-Checkout And Recovers",                      test_participant_crash_recovery),
+    ("order-service",  "Coordinator Crash: Order Service Killed After PREPARE, Recovers Consistently", test_coordinator_crash_recovery),
 ]
