@@ -7,12 +7,22 @@ Aditya Patil · Danil Vorotilov · Pedro Gomes Moreira · Ruben Van Seventer · 
 ### Requirements
 
 - Docker + Docker Compose
-- Python 3.11+ (test runner only)
+- Python 3.11+ (launcher and test runner)
 
 ### Start
 
+The recommended way is the interactive launcher:
+
 ```bash
-# 2PC mode (default)
+python start.py
+```
+
+It will ask for the transaction mode, whether to start the system or run the benchmark suite, and replica counts. All defaults are sensible — just press Enter to accept them.
+
+Alternatively, invoke Docker Compose directly:
+
+```bash
+# TPC mode (default)
 docker compose up -d --build
 
 # SAGA mode
@@ -29,21 +39,14 @@ docker compose down -v
 
 Pass as environment variables before `docker compose up`, or write to a `.env` file at the project root.
 
-
-| Variable                | Default              | Description                                                                                              |
-| ----------------------- | -------------------- | -------------------------------------------------------------------------------------------------------- |
-| `TRANSACTION_MODE`      | `TPC`                | Protocol to use. `TPC` for two-phase commit, `SAGA` for event-driven compensation.                       |
-| `NGINX_CONF`            | `gateway_nginx.conf` | Nginx routing config. Must be `gateway_nginx_saga.conf` when `TRANSACTION_MODE=SAGA`.                    |
-| `REDIS_MAX_CONNECTIONS` | `6000`               | Connection pool size per Redis pool per service worker. Tune to expected peak concurrency.               |
-| `STREAM_BATCH_SIZE`     | `500`                | Messages fetched per `XREADGROUP` call. All messages in a batch are processed concurrently via `gevent`. |
-
-
-Example `.env` for a smaller local machine:
-
-```env
-REDIS_MAX_CONNECTIONS=1200
-STREAM_BATCH_SIZE=100
-```
+| Variable           | Default              | Description                                                                         |
+| ------------------ | -------------------- | ----------------------------------------------------------------------------------- |
+| `TRANSACTION_MODE` | `TPC`                | Protocol to use. `TPC` for two-phase commit, `SAGA` for event-driven compensation.  |
+| `NGINX_CONF`       | `gateway_nginx.conf` | Nginx config file. Must be `gateway_nginx_saga.conf` when `TRANSACTION_MODE=SAGA`.  |
+| `ORDER_REPLICAS`   | `1`                  | Number of order-service containers to run.                                          |
+| `STOCK_REPLICAS`   | `1`                  | Number of stock-service containers to run.                                          |
+| `PAYMENT_REPLICAS` | `1`                  | Number of payment-service containers to run.                                        |
+| `GATEWAY_REPLICAS` | `1`                  | Number of api-gateway containers to run (SAGA mode only).                           |
 
 ## The Orchestrator
 
