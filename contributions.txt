@@ -1,0 +1,36 @@
+# Distributed Data Management — Group 20
+
+## Contributions
+
+How work was divided across the team. Overlap on TPC and SAGA was normal.
+Integration happened through shared reviews and the main branch.
+
+### Aditya Patil
+- TPC — Coordinator Path, Voting, In-Doubt Recovery (Shared Equally With Danil)
+- TPC Suite — Co-Authored With Danil
+- Replication Suite — Sentinel Failover, Service Scale-Out, Durability Cases
+- Benchmarking Suite — Launcher, Interactive Flow, Compose Glue (Shared Equally With Pedro)
+- Orchestrator — Engine Skeleton, Step Dispatch, Redis Checkpoints (Shared Equally With Ruben)
+
+### Danil Vorotilov
+- TPC — Stock And Payment Participants, Stream RPC Hardening (Shared Equally With Aditya)
+- TPC Suite — Co-Authored With Aditya
+- Testing — Runner, Cases, Regression Coverage
+- Profiling — Measurement Passes, Performance Notes
+
+### Pedro Gomes Moreira
+- Benchmarking Suite — Scenarios, Repeatability, Load Shape (Shared Equally With Aditya)
+- Common Suite — Mode-Agnostic Correctness, Durability, Concurrency
+- SAGA Suite — SAGA Protocol Test Coverage
+- SAGA — Participants, Compensation, Stream-Side Behaviour
+
+### Ruben Van Seventer
+- Orchestrator — Suspend, Resume, Fail Semantics, Compensation Ordering (Shared Equally With Aditya)
+- SAGA — Coordinator, Correlation And Gateway Handoff
+- Nginx And Gateway Routing — TPC Versus SAGA Topologies
+- Redis Streams And Bus Integration — Consumer Groups, Internal Request Paths
+- Docker Compose — Multi-Replica Services, Depends-On And Health Wiring
+
+### Veselin Mitev
+- Profiling — Instrumentation Runs And Data Collection
+- Replication — Exploratory Sentinel Failover And Service Scale-Out Drafts
