@@ -194,6 +194,7 @@ def wait_for_services(timeout: int = 90):
 
 def run_suite(label: str, module_name: str) -> tuple[int, int]:
     # import module, run all TESTS entries without prompts; TESTS is (container, name, func)
+    global _fail_count
     mod = importlib.import_module(module_name)
     tests = getattr(mod, "TESTS", [])
 

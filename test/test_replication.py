@@ -1,9 +1,17 @@
 # replication tests — Redis Sentinel failover, replica promotion, data durability under hard kills
+# also covers service-level replication: multiple instances of order/stock/payment services
 
 import concurrent.futures
 import time
 
 from run import api, check, json_field, docker_cmd, wait_for_service
+
+_SCALE_SETTLE_S = 8  # seconds to let new replicas join consumer groups
+
+
+def _scale(service: str, count: int):
+    """Scale a docker compose service to `count` replicas."""
+    docker_cmd(f"docker compose up -d --no-recreate --scale {service}={count}")
 
 # container names follow docker compose's <project>-<service>-<replica> pattern
 _C_ORDER_PRIMARY = "wdm-project-group24-redis-order-1"
@@ -257,6 +265,139 @@ def test_sentinel_no_data_loss_on_promotion():
     time.sleep(5)
 
 
+def test_service_scaling_basic_correctness():
+    # Scale stock-service to 3 instances, verify that CRUD and checkout still
+    # work correctly — requests are correctly routed across replicas.
+    PRICE = 25
+    STOCK = 10
+    CREDIT = 500
+
+    _scale("stock-service", 3)
+    time.sleep(_SCALE_SETTLE_S)
+
+    item = json_field(api("POST", f"/stock/item/create/{PRICE}"), "item_id")
+    api("POST", f"/stock/add/{item}/{STOCK}")
+
+    check(
+        "Service Scaling: Stock Readable After Scale-Out",
+        json_field(api("GET", f"/stock/find/{item}"), "stock") == STOCK,
+    )
+
+    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    api("POST", f"/payment/add_funds/{user}/{CREDIT}")
+    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+    api("POST", f"/orders/addItem/{order}/{item}/1")
+
+    r = api("POST", f"/orders/checkout/{order}")
+    check(
+        "Service Scaling: Checkout Succeeds With 3 Stock Replicas",
+        r.status_code == 200,
+        f"got {r.status_code}",
+    )
+    check(
+        "Service Scaling: Stock Decremented Exactly Once",
+        json_field(api("GET", f"/stock/find/{item}"), "stock") == STOCK - 1,
+    )
+    check(
+        "Service Scaling: Credit Charged Exactly Once",
+        json_field(api("GET", f"/payment/find_user/{user}"), "credit") == CREDIT - PRICE,
+    )
+
+    _scale("stock-service", 1)
+    time.sleep(_SCALE_SETTLE_S)
+
+
+def test_service_replica_killed_system_continues():
+    # Scale order-service to 3, kill one replica, verify remaining 2 handle
+    # new requests without errors.
+    PRICE = 15
+    STOCK = 5
+    CREDIT = 300
+
+    _scale("order-service", 3)
+    time.sleep(_SCALE_SETTLE_S)
+
+    item = json_field(api("POST", f"/stock/item/create/{PRICE}"), "item_id")
+    api("POST", f"/stock/add/{item}/{STOCK}")
+
+    # Kill the third replica (container name follows compose naming)
+    docker_cmd("docker kill wdm-project-group24-order-service-3")
+    time.sleep(2)
+
+    user = json_field(api("POST", "/payment/create_user"), "user_id")
+    api("POST", f"/payment/add_funds/{user}/{CREDIT}")
+    order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+    api("POST", f"/orders/addItem/{order}/{item}/1")
+
+    r = api("POST", f"/orders/checkout/{order}")
+    check(
+        "Service Replica Kill: Checkout Succeeds With 1-Of-3 Order Replica Killed",
+        r.status_code == 200,
+        f"got {r.status_code}",
+    )
+    check(
+        "Service Replica Kill: Stock Decremented Correctly",
+        json_field(api("GET", f"/stock/find/{item}"), "stock") == STOCK - 1,
+    )
+
+    _scale("order-service", 1)
+    time.sleep(_SCALE_SETTLE_S)
+
+
+def test_concurrent_correctness_under_replication():
+    # Scale all services to 3, run N concurrent checkouts for a single item
+    # with exactly N units of stock. Verify no oversell and no phantom charges.
+    PRICE = 20
+    STOCK = 5
+    CREDIT = 500
+    N = 10  # more contenders than stock units to stress the idempotency path
+
+    _scale("order-service", 3)
+    _scale("stock-service", 3)
+    _scale("payment-service", 3)
+    time.sleep(_SCALE_SETTLE_S)
+
+    item = json_field(api("POST", f"/stock/item/create/{PRICE}"), "item_id")
+    api("POST", f"/stock/add/{item}/{STOCK}")
+
+    pairs = []
+    for _ in range(N):
+        user = json_field(api("POST", "/payment/create_user"), "user_id")
+        api("POST", f"/payment/add_funds/{user}/{CREDIT}")
+        order = json_field(api("POST", f"/orders/create/{user}"), "order_id")
+        api("POST", f"/orders/addItem/{order}/{item}/1")
+        pairs.append((user, order))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=N) as pool:
+        results = list(pool.map(lambda p: api("POST", f"/orders/checkout/{p[1]}").status_code, pairs))
+
+    time.sleep(3)  # let any in-flight saga steps settle
+
+    winners = results.count(200)
+    stock = json_field(api("GET", f"/stock/find/{item}"), "stock")
+    charged = sum(
+        1
+        for u, _ in pairs
+        if json_field(api("GET", f"/payment/find_user/{u}"), "credit") != CREDIT
+    )
+
+    check(
+        "Concurrent Replication: Stock + Winners Equals Initial — No Oversell",
+        stock + winners == STOCK,
+        f"stock={stock} winners={winners} initial={STOCK}",
+    )
+    check(
+        "Concurrent Replication: Charged Users Equals Winners — No Phantom Charge",
+        charged == winners,
+        f"charged={charged} winners={winners}",
+    )
+
+    _scale("order-service", 1)
+    _scale("stock-service", 1)
+    _scale("payment-service", 1)
+    time.sleep(_SCALE_SETTLE_S)
+
+
 TESTS = [
     (
         "redis-payment",
@@ -282,5 +423,21 @@ TESTS = [
         "redis-stock",
         "Sentinel: 50 Writes Before Primary SIGKILL — Zero Data Loss",
         test_sentinel_no_data_loss_on_promotion,
+    ),
+    # service replication
+    (
+        "order-service",
+        "Service Replication: Scale Stock To 3 — CRUD And Checkout Correct",
+        test_service_scaling_basic_correctness,
+    ),
+    (
+        "order-service",
+        "Service Replication: Kill One Order Replica — Remaining 2 Handle Requests",
+        test_service_replica_killed_system_continues,
+    ),
+    (
+        "order-service",
+        "Service Replication: 10 Concurrent Checkouts With All Services At 3 — No Oversell Or Phantom Charge",
+        test_concurrent_correctness_under_replication,
     ),
 ]

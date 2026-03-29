@@ -1,8 +1,8 @@
 import json
-import uuid  # still used by _fetch_item_price corr_id
+import os
 import time
 import logging
-import threading
+import requests
 import redis as redis_lib
 from collections import defaultdict
 from db import get_order, get_order_for_update, mark_paid
@@ -20,6 +20,8 @@ from operations import create_order, batch_init_orders, add_item_to_order
 
 logger = logging.getLogger(__name__)
 
+STOCK_SERVICE_URL = os.environ.get("STOCK_SERVICE_URL", "http://stock-service:5000")
+
 GATEWAY_STREAM = "gateway.orders"
 GATEWAY_RESPONSE_STREAM = "gateway.responses"
 INTERNAL_STOCK_STREAM = "internal.stock"
@@ -32,10 +34,6 @@ GROUP_INTERNAL = "order-response-service"
 _redis_pool = None
 _bus_pool = None
 _orchestrator: "Orchestrator | None" = None
-
-# price-lookup correlation: corr_id → (event, response | None)
-_pending_price_lookups: dict = {}
-_pending_price_lookups_lock = threading.Lock()
 
 
 def init(redis_pool, bus_pool):
@@ -201,13 +199,6 @@ def handle_internal_response(payload):
     """Dispatch one message from the internal.responses stream."""
     correlation_id = payload.get("correlation_id", "")
 
-    with _pending_price_lookups_lock:
-        if correlation_id in _pending_price_lookups:
-            event, _ = _pending_price_lookups[correlation_id]
-            _pending_price_lookups[correlation_id] = (event, payload)
-            event.set()
-            return
-
     for suffix in _RESUME_SUFFIXES:
         if correlation_id.endswith(suffix):
             wf_id = correlation_id[: -len(suffix)]
@@ -288,22 +279,12 @@ def route_gateway_message(payload, r):
 
 
 def _fetch_item_price(item_id: str):
-    corr_id = str(uuid.uuid4())
-    event = threading.Event()
-
-    with _pending_price_lookups_lock:
-        _pending_price_lookups[corr_id] = (event, None)
-
-    _publish_internal_request(INTERNAL_STOCK_STREAM, corr_id, "GET", f"/find/{item_id}")
-
-    if not event.wait(timeout=10):
-        with _pending_price_lookups_lock:
-            _pending_price_lookups.pop(corr_id, None)
+    """Fetch item price via direct HTTP GET to stock service."""
+    try:
+        resp = requests.get(f"{STOCK_SERVICE_URL}/find/{item_id}", timeout=5)
+        return {"status_code": resp.status_code, "body": resp.json()}
+    except Exception:
         return None
-
-    with _pending_price_lookups_lock:
-        _, response = _pending_price_lookups.pop(corr_id)
-    return response
 
 
 def start_gateway_consumer():

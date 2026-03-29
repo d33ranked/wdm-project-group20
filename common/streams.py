@@ -8,9 +8,9 @@ import redis as redis_lib
 logger = logging.getLogger(__name__)
 
 BLOCK_MS = 2_000
-import os as _os
+import socket as _socket
 
-CONSUMER_NAME = f"worker-{_os.getpid()}"
+CONSUMER_NAME = f"worker-{_socket.gethostname()}"
 
 _REDIS_MAX_CONNECTIONS = int(os.environ.get("REDIS_MAX_CONNECTIONS", "6000"))
 _STREAM_BATCH_SIZE = int(os.environ.get("STREAM_BATCH_SIZE", "500"))

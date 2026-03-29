@@ -5,8 +5,10 @@ services:
       dockerfile: gateway/Dockerfile
     image: gateway:latest
     restart: on-failure
-    ports:
-      - "8001:8000"
+    deploy:
+      replicas: ${GATEWAY_REPLICAS:-1}
+    expose:
+      - "8000"
     env_file:
       - env/bus.env
       - env/sentinel.env
@@ -35,6 +37,7 @@ services:
     ports:
       - "8000:80"
     depends_on:
+      - api-gateway
       - order-service
       - stock-service
       - payment-service
@@ -45,6 +48,8 @@ services:
       dockerfile: order/Dockerfile
     image: order:latest
     restart: on-failure
+    deploy:
+      replicas: ${ORDER_REPLICAS:-1}
     environment:
       - TRANSACTION_MODE=${TRANSACTION_MODE:-TPC}
       - STOCK_SERVICE_URL=http://stock-service:5000
@@ -88,6 +93,8 @@ services:
       dockerfile: stock/Dockerfile
     image: stock:latest
     restart: on-failure
+    deploy:
+      replicas: ${STOCK_REPLICAS:-1}
     environment:
       - TRANSACTION_MODE=${TRANSACTION_MODE:-TPC}
       - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-6000}
@@ -130,6 +137,8 @@ services:
       dockerfile: payment/Dockerfile
     image: payment:latest
     restart: on-failure
+    deploy:
+      replicas: ${PAYMENT_REPLICAS:-1}
     environment:
       - TRANSACTION_MODE=${TRANSACTION_MODE:-TPC}
       - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-6000}
