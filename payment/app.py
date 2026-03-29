@@ -19,7 +19,7 @@ from common.redis_db import (
 from common.idempotency import check_idempotency, save_idempotency
 from common.streams import create_bus_pool
 
-TRANSACTION_MODE = os.environ.get("TRANSACTION_MODE", "TPC")
+TRANSACTION_MODE = os.environ.get("TRANSACTION_MODE", "SAGA")
 
 app = Flask("payment-service")
 logger = logging.getLogger(__name__)

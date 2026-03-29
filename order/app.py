@@ -20,7 +20,7 @@ from common.redis_db import (
 from common.streams import create_bus_pool
 from operations import create_order, batch_init_orders, add_item_to_order
 
-TRANSACTION_MODE = os.environ.get("TRANSACTION_MODE", "TPC")
+TRANSACTION_MODE = os.environ.get("TRANSACTION_MODE", "SAGA")
 STOCK_SERVICE_URL = os.environ.get("STOCK_SERVICE_URL", "http://stock-service:5000")
 
 app = Flask("order-service")
