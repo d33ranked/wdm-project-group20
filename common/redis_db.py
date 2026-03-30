@@ -110,10 +110,11 @@ class LuaScripts:
         """
         )
 
-        # all-or-nothing: validates all items then deducts
+        # all-or-nothing: validates all items then deducts; returns array of new stock values
         self.deduct_stock_batch = self._r.register_script(
             """
             local n = #KEYS
+            local stocks = {}
             for i = 1, n do
                 local stock = tonumber(redis.call('HGET', KEYS[i], 'stock'))
                 if stock == nil then
@@ -122,21 +123,26 @@ class LuaScripts:
                 if stock < tonumber(ARGV[i]) then
                     return redis.error_reply('INSUFFICIENT:' .. KEYS[i])
                 end
+                stocks[i] = stock
             end
+            local result = {}
             for i = 1, n do
-                local new_stock = tonumber(redis.call('HGET', KEYS[i], 'stock')) - tonumber(ARGV[i])
+                local new_stock = stocks[i] - tonumber(ARGV[i])
                 redis.call('HSET', KEYS[i], 'stock', new_stock)
+                result[i] = new_stock
             end
-            return 1
+            return result
         """
         )
 
+        # returns array of new stock values (HINCRBY returns the post-increment value)
         self.restore_stock_batch = self._r.register_script(
             """
+            local result = {}
             for i = 1, #KEYS do
-                redis.call('HINCRBY', KEYS[i], 'stock', tonumber(ARGV[i]))
+                result[i] = redis.call('HINCRBY', KEYS[i], 'stock', tonumber(ARGV[i]))
             end
-            return 1
+            return result
         """
         )
 

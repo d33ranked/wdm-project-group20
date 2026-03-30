@@ -55,29 +55,15 @@ def _get_bus():
 def db_subtract_stock_batch(r, items):
     keys = [f"item:{item_id}" for item_id, _ in items]
     args = [qty for _, qty in items]
-    _scripts.deduct_stock_batch(keys=keys, args=args, client=r)
-    pipe = r.pipeline(transaction=False)
-    for item_id, _ in items:
-        pipe.hget(f"item:{item_id}", "stock")
-    stocks = pipe.execute()
-    return {
-        item_id: int(s) if s is not None else 0
-        for (item_id, _), s in zip(items, stocks)
-    }
+    new_stocks = _scripts.deduct_stock_batch(keys=keys, args=args, client=r)
+    return {item_id: int(s) for (item_id, _), s in zip(items, new_stocks)}
 
 
 def db_add_stock_batch(r, items):
     keys = [f"item:{item_id}" for item_id, _ in items]
     args = [qty for _, qty in items]
-    _scripts.restore_stock_batch(keys=keys, args=args, client=r)
-    pipe = r.pipeline(transaction=False)
-    for item_id, _ in items:
-        pipe.hget(f"item:{item_id}", "stock")
-    stocks = pipe.execute()
-    return {
-        item_id: int(s) if s is not None else 0
-        for (item_id, _), s in zip(items, stocks)
-    }
+    new_stocks = _scripts.restore_stock_batch(keys=keys, args=args, client=r)
+    return {item_id: int(s) for (item_id, _), s in zip(items, new_stocks)}
 
 
 def route_stream_message(payload, r):

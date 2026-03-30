@@ -25,6 +25,15 @@ TPC_TIMEOUT_S = 15  # stock restarts in ~3s; 15s gives plenty of margin
 _tpc_client: "TpcStreamClient | None" = None
 _orchestrator: "Orchestrator | None" = None
 _redis_pool = None
+_release_lock_script = None
+
+_RELEASE_LOCK_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    redis.call('DEL', KEYS[1])
+    return 1
+end
+return 0
+"""
 
 
 class TpcStreamClient:
@@ -72,12 +81,15 @@ class TpcStreamClient:
 
 
 def init_bus(bus_pool, redis_pool):
-    global _tpc_client, _orchestrator, _redis_pool
+    global _tpc_client, _orchestrator, _redis_pool, _release_lock_script
     _redis_pool = redis_pool
     bus = get_bus(bus_pool)
     ensure_groups(bus, [(TPC_RESPONSE_STREAM, "tpc-init")])
     _tpc_client = TpcStreamClient(bus_pool)
     _orchestrator = Orchestrator(redis_pool)
+    _release_lock_script = redis_lib.Redis(connection_pool=redis_pool).register_script(
+        _RELEASE_LOCK_LUA
+    )
 
 
 def _send(stream: str, payload: dict, correlation_id: str) -> dict:
@@ -107,16 +119,7 @@ def _acquire_checkout_lock(r, order_id: str, lock_token: str) -> bool:
 
 
 def _release_checkout_lock(r, order_id: str, lock_token: str):
-    release_script = r.register_script(
-        """
-        if redis.call('GET', KEYS[1]) == ARGV[1] then
-            redis.call('DEL', KEYS[1])
-            return 1
-        end
-        return 0
-        """
-    )
-    release_script(keys=[f"checkout-lock:{order_id}"], args=[lock_token])
+    _release_lock_script(keys=[f"checkout-lock:{order_id}"], args=[lock_token], client=r)
 
 
 def _step_prepare_stock(ctx):
@@ -154,22 +157,20 @@ def _step_prepare_payment(ctx):
 
 
 def _step_commit(ctx):
-    _publish(
+    wf_id = ctx["wf_id"]
+    bus = get_bus(_tpc_client._pool)
+    pipe = bus.pipeline(transaction=False)
+    pipe.xadd(
         TPC_STOCK_STREAM,
-        {
-            "correlation_id": f"{ctx['wf_id']}:stock:commit",
-            "command": "commit",
-            "txn_id": ctx["wf_id"],
-        },
+        {"data": json.dumps({"correlation_id": f"{wf_id}:stock:commit", "command": "commit", "txn_id": wf_id})},
+        maxlen=50_000, approximate=True,
     )
-    _publish(
+    pipe.xadd(
         TPC_PAYMENT_STREAM,
-        {
-            "correlation_id": f"{ctx['wf_id']}:payment:commit",
-            "command": "commit",
-            "txn_id": ctx["wf_id"],
-        },
+        {"data": json.dumps({"correlation_id": f"{wf_id}:payment:commit", "command": "commit", "txn_id": wf_id})},
+        maxlen=50_000, approximate=True,
     )
+    pipe.execute()
     r = redis_lib.Redis(connection_pool=_redis_pool)
     r.hset(f"order:{ctx['order_id']}", "paid", "true")
 
@@ -234,7 +235,7 @@ def checkout_tpc(order_id: str):
 
         context_items = [[iid, qty] for iid, qty in sorted(items_quantities.items())]
 
-        wf_id = _orchestrator.start(
+        _wf_id, status, error = _orchestrator.start(
             CHECKOUT_WORKFLOW,
             {
                 "order_id": order_id,
@@ -244,7 +245,6 @@ def checkout_tpc(order_id: str):
             },
         )
 
-        status, error, _ = _orchestrator.get_status(wf_id)
         if status == _orchestrator.COMPLETED:
             return Response("Checkout successful", status=200)
         else:

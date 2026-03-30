@@ -56,7 +56,13 @@ class Orchestrator:
     def _r(self):
         return redis_lib.Redis(connection_pool=self._pool)
 
-    def start(self, workflow: Workflow, context: dict) -> str:
+    def start(self, workflow: Workflow, context: dict) -> tuple:
+        """Create and run a new workflow instance.
+
+        Returns (wf_id, status, error) so synchronous callers (TPC) can skip
+        a follow-up get_status() round-trip. Async callers (SAGA) may ignore
+        the return value.
+        """
         wf_id = str(uuid.uuid4())
         context = dict(context)
         context["wf_id"] = wf_id
@@ -70,8 +76,8 @@ class Orchestrator:
                 "context": json.dumps(context),
             },
         )
-        self._execute_forward(workflow, wf_id, r, 0, context)
-        return wf_id
+        status, error = self._execute_forward(workflow, wf_id, r, 0, context)
+        return wf_id, status, error
 
     def resume(self, workflow: Workflow, wf_id: str, result: dict = None):
         """Signal that an async forward step completed successfully.
@@ -85,17 +91,12 @@ class Orchestrator:
         if not raw or raw.get("status") != self.WAITING:
             return
         ctx = json.loads(raw["context"])
+        next_step = int(raw["step"]) + 1
+        mapping: dict = {"step": str(next_step), "status": self.RUNNING}
         if result:
             ctx.update(result)
-        next_step = int(raw["step"]) + 1
-        r.hset(
-            f"{self._PREFIX}{wf_id}",
-            mapping={
-                "step": str(next_step),
-                "status": self.RUNNING,
-                "context": json.dumps(ctx),
-            },
-        )
+            mapping["context"] = json.dumps(ctx)
+        r.hset(f"{self._PREFIX}{wf_id}", mapping=mapping)
         self._execute_forward(workflow, wf_id, r, next_step, ctx)
 
     def fail(self, workflow: Workflow, wf_id: str, error: str = ""):
@@ -206,7 +207,7 @@ class Orchestrator:
                 step = int(raw.get("step", "0"))
                 self._execute_compensation(workflow, wf_id, r, ctx, failed_at=step)
 
-    def _execute_forward(self, workflow, wf_id, r, step_idx, ctx):
+    def _execute_forward(self, workflow, wf_id, r, step_idx, ctx) -> tuple:
         for idx in range(step_idx, len(workflow.steps)):
             r.hset(f"{self._PREFIX}{wf_id}", "step", str(idx))
             try:
@@ -217,7 +218,7 @@ class Orchestrator:
 
             except _AsyncSuspend:
                 r.hset(f"{self._PREFIX}{wf_id}", "status", self.WAITING)
-                return
+                return self.WAITING, ""
 
             except StepFailed as exc:
                 ctx["_error"] = str(exc)
@@ -229,8 +230,7 @@ class Orchestrator:
                         "context": json.dumps(ctx),
                     },
                 )
-                self._execute_compensation(workflow, wf_id, r, ctx, failed_at=idx)
-                return
+                return self._execute_compensation(workflow, wf_id, r, ctx, failed_at=idx)
 
         r.hset(f"{self._PREFIX}{wf_id}", "status", self.COMPLETED)
         if workflow.on_complete:
@@ -238,8 +238,9 @@ class Orchestrator:
                 workflow.on_complete(ctx)
             except Exception as exc:
                 logger.error("on_complete failed for wf %s: %s", wf_id, exc)
+        return self.COMPLETED, ""
 
-    def _execute_compensation(self, workflow, wf_id, r, ctx, failed_at):
+    def _execute_compensation(self, workflow, wf_id, r, ctx, failed_at) -> tuple:
         """Run comp[failed_at-1] down to comp[0].
 
         failed_at is the index of the step that failed; only steps 0..failed_at-1
@@ -254,7 +255,7 @@ class Orchestrator:
 
             except _AsyncSuspend:
                 r.hset(f"{self._PREFIX}{wf_id}", "status", self.WAITING_COMP)
-                return
+                return self.WAITING_COMP, ctx.get("_error", "")
 
             except Exception as exc:
                 logger.error(
@@ -267,6 +268,7 @@ class Orchestrator:
                 workflow.on_failed(ctx)
             except Exception as exc:
                 logger.error("on_failed callback failed for wf %s: %s", wf_id, exc)
+        return self.FAILED, ctx.get("_error", "")
 
 
 class _AsyncSuspend(BaseException):
