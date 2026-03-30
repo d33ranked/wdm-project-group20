@@ -20,7 +20,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 TEST_RUNNER = os.path.join(PROJECT_ROOT, "test", "run.py")
 
 DEFAULT_REDIS_MAX = 6000
-DEFAULT_STREAM_BATCH = 500
+DEFAULT_STREAM_BATCH = 100
 
 _RST = "\033[0m"
 

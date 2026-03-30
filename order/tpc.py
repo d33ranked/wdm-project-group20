@@ -10,6 +10,7 @@ from collections import defaultdict
 from flask import g, abort, Response
 from common.orchestrator import Orchestrator, Workflow, StepFailed
 from common.stream_rpc import StreamRpc
+import os
 from common.streams import get_bus, ensure_groups, publish
 
 logger = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 TPC_STOCK_STREAM = "tpc.stock"
 TPC_PAYMENT_STREAM = "tpc.payment"
 TPC_RESPONSE_STREAM = "tpc.responses"
+_RESPONSE_BATCH_SIZE = int(os.environ.get("STREAM_BATCH_SIZE", "100"))
 
 TPC_TIMEOUT_S = 15  # stock restarts in ~3s; 15s gives plenty of margin
 
@@ -43,7 +45,7 @@ class TpcStreamClient:
                 try:
                     result = bus.xread(
                         {TPC_RESPONSE_STREAM: last_id},
-                        count=100,
+                        count=_RESPONSE_BATCH_SIZE,
                         block=2000,
                     )
                     if not result:

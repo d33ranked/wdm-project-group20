@@ -13,7 +13,7 @@ import socket as _socket
 CONSUMER_NAME = f"worker-{_socket.gethostname()}"
 
 _REDIS_MAX_CONNECTIONS = int(os.environ.get("REDIS_MAX_CONNECTIONS", "6000"))
-_STREAM_BATCH_SIZE = int(os.environ.get("STREAM_BATCH_SIZE", "500"))
+_STREAM_BATCH_SIZE = int(os.environ.get("STREAM_BATCH_SIZE", "100"))
 
 
 def create_bus_pool() -> redis_lib.ConnectionPool:

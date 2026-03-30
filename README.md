@@ -49,7 +49,7 @@ docker compose down -v
 | `STOCK_REPLICAS`        | `2`                       | Number of Stock Service Containers.                                                                      |
 | `PAYMENT_REPLICAS`      | `2`                       | Number of Payment Service Containers.                                                                    |
 | `REDIS_MAX_CONNECTIONS` | `6000`                    | Connection Pool Size Per Redis Pool Per Service Worker.                                                  |
-| `STREAM_BATCH_SIZE`     | `500`                     | Messages Fetched Per `XREADGROUP` Call. All Messages in a Batch Are Processed Concurrently via `gevent`. |
+| `STREAM_BATCH_SIZE`     | `100`                     | Messages Fetched Per `XREADGROUP` Call. All Messages in a Batch Are Processed Concurrently via `gevent`. |
 | `DDM_SKIP_BUILD`        | *(unset)*                 | Set to `1` to Skip `docker compose build` When Running the Test Suite Headlessly.                        |
 | `DDM_NO_RESTART`        | *(unset)*                 | Set to `1` to Skip `docker compose down/up` and Reuse the Running Stack.                                 |
 

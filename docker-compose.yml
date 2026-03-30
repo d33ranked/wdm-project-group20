@@ -16,6 +16,7 @@ services:
       - env/sentinel.env
     environment:
       - REQUEST_TIMEOUT_MS=30000
+      - STREAM_BATCH_SIZE=${STREAM_BATCH_SIZE:-100}
     depends_on:
       redis-bus:
         condition: service_healthy
@@ -56,7 +57,7 @@ services:
       - TRANSACTION_MODE=${TRANSACTION_MODE:-SAGA}
       - STOCK_SERVICE_URL=http://stock-service:5000
       - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-6000}
-      - STREAM_BATCH_SIZE=${STREAM_BATCH_SIZE:-500}
+      - STREAM_BATCH_SIZE=${STREAM_BATCH_SIZE:-100}
     command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --worker-connections 6000 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
@@ -80,6 +81,7 @@ services:
       redis-server
       --appendonly yes
       --appendfsync everysec
+      --auto-aof-rewrite-percentage 0
       --maxmemory-policy noeviction
       --maxclients 7000
     healthcheck:
@@ -100,7 +102,7 @@ services:
     environment:
       - TRANSACTION_MODE=${TRANSACTION_MODE:-SAGA}
       - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-6000}
-      - STREAM_BATCH_SIZE=${STREAM_BATCH_SIZE:-500}
+      - STREAM_BATCH_SIZE=${STREAM_BATCH_SIZE:-100}
     command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --worker-connections 6000 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
@@ -124,6 +126,7 @@ services:
       redis-server
       --appendonly yes
       --appendfsync everysec
+      --auto-aof-rewrite-percentage 0
       --maxmemory-policy noeviction
       --maxclients 7000
     healthcheck:
@@ -144,7 +147,7 @@ services:
     environment:
       - TRANSACTION_MODE=${TRANSACTION_MODE:-SAGA}
       - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-6000}
-      - STREAM_BATCH_SIZE=${STREAM_BATCH_SIZE:-500}
+      - STREAM_BATCH_SIZE=${STREAM_BATCH_SIZE:-100}
     command: gunicorn -k gevent -b 0.0.0.0:5000 -w 1 --worker-connections 6000 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
@@ -168,6 +171,7 @@ services:
       redis-server
       --appendonly yes
       --appendfsync everysec
+      --auto-aof-rewrite-percentage 0
       --maxmemory-policy noeviction
       --maxclients 7000
     healthcheck:
@@ -202,6 +206,7 @@ services:
       --replicaof redis-order 6379
       --appendonly yes
       --appendfsync everysec
+      --auto-aof-rewrite-percentage 0
       --maxmemory-policy noeviction
       --maxclients 7000
     depends_on:
@@ -216,6 +221,7 @@ services:
       --replicaof redis-stock 6379
       --appendonly yes
       --appendfsync everysec
+      --auto-aof-rewrite-percentage 0
       --maxmemory-policy noeviction
       --maxclients 7000
     depends_on:
@@ -230,6 +236,7 @@ services:
       --replicaof redis-payment 6379
       --appendonly yes
       --appendfsync everysec
+      --auto-aof-rewrite-percentage 0
       --maxmemory-policy noeviction
       --maxclients 7000
     depends_on:

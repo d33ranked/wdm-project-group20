@@ -18,6 +18,7 @@ from common.streams import create_bus_pool, get_bus, ensure_groups, publish
 GATEWAY_STREAMS = ["gateway.orders", "gateway.stock", "gateway.payment"]
 RESPONSE_STREAM = "gateway.responses"
 REQUEST_TIMEOUT_S = int(os.environ.get("REQUEST_TIMEOUT_MS", "30000")) / 1000
+_RESPONSE_BATCH_SIZE = int(os.environ.get("STREAM_BATCH_SIZE", "100"))
 
 _STRIP_HEADERS = {"host", "connection", "transfer-encoding", "content-length"}
 
@@ -48,7 +49,7 @@ class StreamClient:
                 try:
                     result = bus.xread(
                         {RESPONSE_STREAM: last_id},
-                        count=100,
+                        count=_RESPONSE_BATCH_SIZE,
                         block=2000,
                     )
                     if not result:
