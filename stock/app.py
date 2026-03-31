@@ -14,6 +14,7 @@ from common.redis_db import (
     create_redis_pool,
     setup_flask_lifecycle,
     setup_gunicorn_logging,
+    warmup_pool,
     LuaScripts,
 )
 from common.idempotency import check_idempotency, save_idempotency
@@ -132,6 +133,8 @@ with app.app_context():
 
     elif TRANSACTION_MODE == "SAGA":
         saga.init(redis_pool, _scripts, bus_pool)
+        warmup_pool(redis_pool)
+        warmup_pool(bus_pool)
 
         try:
             saga.recovery_saga(redis_pool)

@@ -56,6 +56,25 @@ def get_redis(pool: redis.ConnectionPool) -> redis.Redis:
     return redis.Redis(connection_pool=pool)
 
 
+def warmup_pool(pool: redis.ConnectionPool, count: int = 20) -> None:
+    """Pre-establish `count` connections in the pool by issuing concurrent PINGs.
+
+    On cold start, all pool connections are created lazily on first use.
+    When 1000 requests hit simultaneously, hundreds of TCP connections are
+    established at once, causing a queuing spike that can push some responses
+    past the gateway's 30s timeout. Pre-warming avoids that spike.
+    """
+    import gevent
+
+    def _ping():
+        try:
+            redis.Redis(connection_pool=pool).ping()
+        except Exception:
+            pass
+
+    gevent.joinall([gevent.spawn(_ping) for _ in range(count)])
+
+
 def setup_flask_lifecycle(app, pool: redis.ConnectionPool, service_name: str):
     @app.before_request
     def _before():

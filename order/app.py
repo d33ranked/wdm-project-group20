@@ -16,6 +16,7 @@ from common.redis_db import (
     create_redis_pool,
     setup_flask_lifecycle,
     setup_gunicorn_logging,
+    warmup_pool,
 )
 from common.streams import create_bus_pool
 from operations import create_order, batch_init_orders, add_item_to_order
@@ -118,6 +119,8 @@ with app.app_context():
 
     elif TRANSACTION_MODE == "SAGA":
         saga.init(redis_pool, bus_pool)
+        warmup_pool(redis_pool)
+        warmup_pool(bus_pool)
 
         try:
             saga.recovery_saga()
