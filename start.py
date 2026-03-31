@@ -22,6 +22,31 @@ TEST_RUNNER = os.path.join(PROJECT_ROOT, "test", "run.py")
 DEFAULT_REDIS_MAX = 6000
 DEFAULT_STREAM_BATCH = 100
 
+# CPU resource limit configurations (for services)
+# Option 1: No limits - unbounded, can use all cores
+# Option 2: Shared core - all containers compete on core 0 with 0.5 CPU each
+# Option 3: One core per container - each container type gets exclusive core
+_RESOURCE_LIMITS = {
+    1: {
+        "app_cpus": "0", "app_cpuset": "",
+        "redis_cpus": "0", "redis_cpuset": "",
+        "sentinel_cpus": "0", "sentinel_cpuset": "",
+        "nginx_cpus": "0", "nginx_cpuset": "",
+    },
+    2: {
+        "app_cpus": "0.5", "app_cpuset": "0",
+        "redis_cpus": "0.5", "redis_cpuset": "0",
+        "sentinel_cpus": "0.5", "sentinel_cpuset": "0",
+        "nginx_cpus": "0.5", "nginx_cpuset": "0",
+    },
+    3: {
+        "app_cpus": "1.0", "app_cpuset": "0",
+        "redis_cpus": "1.0", "redis_cpuset": "1",
+        "sentinel_cpus": "1.0", "sentinel_cpuset": "2",
+        "nginx_cpus": "1.0", "nginx_cpuset": "3",
+    },
+}
+
 _RST = "\033[0m"
 
 
@@ -69,6 +94,16 @@ def ask(prompt: str, a: str, b: str) -> int:
         if s in ("1", "2"):
             return int(s)
         print(_red("Use 1 Or 2."))
+
+
+def ask_three(prompt: str, a: str, b: str, c: str) -> int:
+    while True:
+        s = input(
+            f"{_cy(prompt)} {_dim('1=')}{a} {_dim('2=')}{b} {_dim('3=')}{c} {_cy('>')} "
+        ).strip()
+        if s in ("1", "2", "3"):
+            return int(s)
+        print(_red("Use 1, 2, Or 3."))
 
 
 _SUMMARY_INDENT = "  "
@@ -122,6 +157,22 @@ def _apply_replicas(env: dict, layout: int) -> None:
         env["PAYMENT_REPLICAS"] = str(ask_int("Payment Service", 2, scoped=True))
 
 
+def _apply_resource_limits(env: dict, limits: int) -> None:
+    config = _RESOURCE_LIMITS[limits]
+    # Application services
+    env["SERVICE_CPU_LIMIT"] = config["app_cpus"]
+    env["SERVICE_CPUSET"] = config["app_cpuset"]
+    # Redis containers
+    env["REDIS_CPU_LIMIT"] = config["redis_cpus"]
+    env["REDIS_CPUSET"] = config["redis_cpuset"]
+    # Sentinel containers
+    env["SENTINEL_CPU_LIMIT"] = config["sentinel_cpus"]
+    env["SENTINEL_CPUSET"] = config["sentinel_cpuset"]
+    # Nginx load balancer
+    env["NGINX_CPU_LIMIT"] = config["nginx_cpus"]
+    env["NGINX_CPUSET"] = config["nginx_cpuset"]
+
+
 def _apply_stream_tuning(env: dict, tune: int) -> None:
     if tune == 1:
         env["REDIS_MAX_CONNECTIONS"] = str(DEFAULT_REDIS_MAX)
@@ -150,8 +201,18 @@ def _print_summary_rows(
 
 
 def _summary_base_rows(env: dict) -> list:
+    limits_desc = (
+        "Shared Core"
+        if env["SERVICE_CPUSET"] == "0"
+        else (
+            "One Core Per Container"
+            if env["SERVICE_CPU_LIMIT"] == "1.0"
+            else "No Limits"
+        )
+    )
     return [
         ("Transaction Mode", env["TRANSACTION_MODE"], "grey"),
+        ("Resource Limits", limits_desc, "grey"),
         ("Gateway Service", env["GATEWAY_REPLICAS"]),
         ("Order Service", env["ORDER_REPLICAS"]),
         ("Stock Service", env["STOCK_REPLICAS"]),
@@ -177,6 +238,9 @@ def main() -> None:
         action = ask("Action?", "Start Stack", "Run Tests")
 
         env = env_for_mode(mode)
+
+        limits = ask_three("Resource Limits?", "No Limits", "Shared Core", "One Core Per Container")
+        _apply_resource_limits(env, limits)
 
         layout = ask("Replicas?", "Compose Defaults", "Custom")
         _apply_replicas(env, layout)

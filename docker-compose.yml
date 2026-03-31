@@ -7,6 +7,8 @@ services:
       dockerfile: gateway/Dockerfile
     image: gateway:latest
     restart: on-failure
+    cpus: ${SERVICE_CPU_LIMIT:-0}
+    cpuset: ${SERVICE_CPUSET:-}
     deploy:
       replicas: ${GATEWAY_REPLICAS:-1}
     expose:
@@ -35,6 +37,8 @@ services:
 
   nginx:
     image: nginx:1.25-bookworm
+    cpus: ${NGINX_CPU_LIMIT:-0}
+    cpuset: ${NGINX_CPUSET:-}
     volumes:
       - ./${NGINX_CONF:-gateway_nginx_saga.conf}:/etc/nginx/nginx.conf:ro
     ports:
@@ -51,6 +55,8 @@ services:
       dockerfile: order/Dockerfile
     image: order:latest
     restart: on-failure
+    cpus: ${SERVICE_CPU_LIMIT:-0}
+    cpuset: ${SERVICE_CPUSET:-}
     deploy:
       replicas: ${ORDER_REPLICAS:-2}
     environment:
@@ -77,6 +83,8 @@ services:
 
   redis-order:
     image: redis:7-alpine
+    cpus: ${REDIS_CPU_LIMIT:-0}
+    cpuset: ${REDIS_CPUSET:-}
     command: >
       redis-server
       --appendonly yes
@@ -98,6 +106,8 @@ services:
       dockerfile: stock/Dockerfile
     image: stock:latest
     restart: on-failure
+    cpus: ${SERVICE_CPU_LIMIT:-0}
+    cpuset: ${SERVICE_CPUSET:-}
     deploy:
       replicas: ${STOCK_REPLICAS:-2}
     environment:
@@ -123,6 +133,8 @@ services:
 
   redis-stock:
     image: redis:7-alpine
+    cpus: ${REDIS_CPU_LIMIT:-0}
+    cpuset: ${REDIS_CPUSET:-}
     command: >
       redis-server
       --appendonly yes
@@ -144,6 +156,8 @@ services:
       dockerfile: payment/Dockerfile
     image: payment:latest
     restart: on-failure
+    cpus: ${SERVICE_CPU_LIMIT:-0}
+    cpuset: ${SERVICE_CPUSET:-}
     deploy:
       replicas: ${PAYMENT_REPLICAS:-2}
     environment:
@@ -169,6 +183,8 @@ services:
 
   redis-payment:
     image: redis:7-alpine
+    cpus: ${REDIS_CPU_LIMIT:-0}
+    cpuset: ${REDIS_CPUSET:-}
     command: >
       redis-server
       --appendonly yes
@@ -189,6 +205,8 @@ services:
   # does not drop in-flight messages
   redis-bus:
     image: redis:7-alpine
+    cpus: ${REDIS_CPU_LIMIT:-0}
+    cpuset: ${REDIS_CPUSET:-}
     command: >
       redis-server
       --appendonly no
@@ -203,6 +221,8 @@ services:
 
   redis-order-replica:
     image: redis:7-alpine
+    cpus: ${REDIS_CPU_LIMIT:-0}
+    cpuset: ${REDIS_CPUSET:-}
     restart: on-failure
     command: >
       redis-server
@@ -219,6 +239,8 @@ services:
 
   redis-stock-replica:
     image: redis:7-alpine
+    cpus: ${REDIS_CPU_LIMIT:-0}
+    cpuset: ${REDIS_CPUSET:-}
     restart: on-failure
     command: >
       redis-server
@@ -235,6 +257,8 @@ services:
 
   redis-payment-replica:
     image: redis:7-alpine
+    cpus: ${REDIS_CPU_LIMIT:-0}
+    cpuset: ${REDIS_CPUSET:-}
     restart: on-failure
     command: >
       redis-server
@@ -251,6 +275,8 @@ services:
 
   redis-bus-replica:
     image: redis:7-alpine
+    cpus: ${REDIS_CPU_LIMIT:-0}
+    cpuset: ${REDIS_CPUSET:-}
     restart: on-failure
     command: >
       redis-server
@@ -264,6 +290,8 @@ services:
 
   sentinel-1:
     image: redis:7-alpine
+    cpus: ${SENTINEL_CPU_LIMIT:-0}
+    cpuset: ${SENTINEL_CPUSET:-}
     restart: on-failure
     volumes:
       - ./sentinel.conf:/etc/redis/sentinel.conf.template:ro
@@ -288,6 +316,8 @@ services:
 
   sentinel-2:
     image: redis:7-alpine
+    cpus: ${SENTINEL_CPU_LIMIT:-0}
+    cpuset: ${SENTINEL_CPUSET:-}
     restart: on-failure
     volumes:
       - ./sentinel.conf:/etc/redis/sentinel.conf.template:ro
@@ -312,6 +342,8 @@ services:
 
   sentinel-3:
     image: redis:7-alpine
+    cpus: ${SENTINEL_CPU_LIMIT:-0}
+    cpuset: ${SENTINEL_CPUSET:-}
     restart: on-failure
     volumes:
       - ./sentinel.conf:/etc/redis/sentinel.conf.template:ro
