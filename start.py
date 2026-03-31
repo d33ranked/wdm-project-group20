@@ -22,31 +22,6 @@ TEST_RUNNER = os.path.join(PROJECT_ROOT, "test", "run.py")
 DEFAULT_REDIS_MAX = 6000
 DEFAULT_STREAM_BATCH = 100
 
-# CPU resource limit configurations (for services)
-# Option 1: No limits - unbounded, can use all cores
-# Option 2: Shared core - all containers compete on core 0 with 0.5 CPU each
-# Option 3: One core per container - each container type gets exclusive core
-_RESOURCE_LIMITS = {
-    1: {
-        "app_cpus": "0", "app_cpuset": "",
-        "redis_cpus": "0", "redis_cpuset": "",
-        "sentinel_cpus": "0", "sentinel_cpuset": "",
-        "nginx_cpus": "0", "nginx_cpuset": "",
-    },
-    2: {
-        "app_cpus": "0.5", "app_cpuset": "0",
-        "redis_cpus": "0.5", "redis_cpuset": "0",
-        "sentinel_cpus": "0.5", "sentinel_cpuset": "0",
-        "nginx_cpus": "0.5", "nginx_cpuset": "0",
-    },
-    3: {
-        "app_cpus": "1.0", "app_cpuset": "0",
-        "redis_cpus": "1.0", "redis_cpuset": "1",
-        "sentinel_cpus": "1.0", "sentinel_cpuset": "2",
-        "nginx_cpus": "1.0", "nginx_cpuset": "3",
-    },
-}
-
 _RST = "\033[0m"
 
 
@@ -144,33 +119,95 @@ def env_for_mode(mode: str) -> dict:
 
 
 def _apply_replicas(env: dict, layout: int) -> None:
-    # matches docker-compose: gateway :-1, order/stock/payment :-2
     if layout == 1:
+        # TODO: Code duplication with the defaults in docker-compose.yml
         env["GATEWAY_REPLICAS"] = "1"
         env["ORDER_REPLICAS"] = "2"
         env["STOCK_REPLICAS"] = "2"
         env["PAYMENT_REPLICAS"] = "2"
-    else:
+    elif layout == 2:
         env["GATEWAY_REPLICAS"] = str(ask_int("Gateway Service", 1, scoped=True))
         env["ORDER_REPLICAS"] = str(ask_int("Order Service", 2, scoped=True))
         env["STOCK_REPLICAS"] = str(ask_int("Stock Service", 2, scoped=True))
         env["PAYMENT_REPLICAS"] = str(ask_int("Payment Service", 2, scoped=True))
+    else: # We have 50 CPUs at our disposal
+        # Fixed containers (12 total): TODO: Adjust this as necessary
+        #   nginx, redis-order, redis-stock, redis-payment, redis-bus,
+        #   redis-order-replica, redis-stock-replica, redis-payment-replica,
+        #   redis-bus-replica, sentinel-1, sentinel-2, sentinel-3
+        # Remaining 38 CPUs for scalable services
+        # TODO: Tune these values to get better performance
+        # TODO: Each service replica should have its own DB cluster, so this would need to be
+        # adjusted once we fix that.
+        env["GATEWAY_REPLICAS"] = "4"
+        env["ORDER_REPLICAS"] = "10"
+        env["STOCK_REPLICAS"] = "12"
+        env["PAYMENT_REPLICAS"] = "12"
 
 
 def _apply_resource_limits(env: dict, limits: int) -> None:
-    config = _RESOURCE_LIMITS[limits]
-    # Application services
-    env["SERVICE_CPU_LIMIT"] = config["app_cpus"]
-    env["SERVICE_CPUSET"] = config["app_cpuset"]
-    # Redis containers
-    env["REDIS_CPU_LIMIT"] = config["redis_cpus"]
-    env["REDIS_CPUSET"] = config["redis_cpuset"]
-    # Sentinel containers
-    env["SENTINEL_CPU_LIMIT"] = config["sentinel_cpus"]
-    env["SENTINEL_CPUSET"] = config["sentinel_cpuset"]
-    # Nginx load balancer
-    env["NGINX_CPU_LIMIT"] = config["nginx_cpus"]
-    env["NGINX_CPUSET"] = config["nginx_cpuset"]
+    if limits == 1:
+        env["RESOURCE_LIMITS_DESCRIPTION"] = "No Limits"
+        for container in [
+            "GATEWAY",
+            "ORDER", 
+            "STOCK",
+            "PAYMENT",
+            "SERVICE",
+            "REDIS",
+            "SENTINEL",
+            "NGINX",
+            "REDIS_ORDER",
+            "REDIS_STOCK",
+            "REDIS_PAYMENT",
+            "REDIS_BUS"
+        ]:
+            env[f"{container}_CPU_LIMIT"] = "0"
+            env[f"{container}_CPUSET"] = ""
+    elif limits == 2:
+        env["RESOURCE_LIMITS_DESCRIPTION"] = "Shared Core"
+        for container in [
+            "GATEWAY",
+            "ORDER", 
+            "STOCK",
+            "PAYMENT",
+            "SERVICE",
+            "REDIS",
+            "SENTINEL",
+            "NGINX",
+            "REDIS_ORDER",
+            "REDIS_STOCK",
+            "REDIS_PAYMENT",
+            "REDIS_BUS"
+        ]:
+            env[f"{container}_CPU_LIMIT"] = "0"
+            env[f"{container}_CPUSET"] = "0"
+    else:
+        env["RESOURCE_LIMITS_DESCRIPTION"] = "One Core Per Container"
+        curr_cpu = 0
+        for fixed_container in [
+            "NGINX",
+            "REDIS_ORDER",
+            "REDIS_STOCK",
+            "REDIS_PAYMENT",
+            "REDIS_BUS",
+            "SENTINEL_1",
+            "SENTINEL_2",
+            "SENTINEL_3"
+        ]:
+            env[f"{fixed_container}_CPU_LIMIT"] = "1.0"
+            env[f"{fixed_container}_CPUSET"] = str(curr_cpu)
+            curr_cpu += 1
+            
+        for replicated_container in [
+            "GATEWAY",
+            "ORDER", 
+            "STOCK",
+            "PAYMENT",
+        ]:
+            env[f"{replicated_container}_CPU_LIMIT"] = "1.0"
+            env[f"{replicated_container}_CPUSET"] = f"{curr_cpu}-{curr_cpu + env[f'{replicated_container}_REPLICAS']}"
+            curr_cpu += env[f"{replicated_container}_REPLICAS"]
 
 
 def _apply_stream_tuning(env: dict, tune: int) -> None:
@@ -201,18 +238,9 @@ def _print_summary_rows(
 
 
 def _summary_base_rows(env: dict) -> list:
-    limits_desc = (
-        "Shared Core"
-        if env["SERVICE_CPUSET"] == "0"
-        else (
-            "One Core Per Container"
-            if env["SERVICE_CPU_LIMIT"] == "1.0"
-            else "No Limits"
-        )
-    )
     return [
         ("Transaction Mode", env["TRANSACTION_MODE"], "grey"),
-        ("Resource Limits", limits_desc, "grey"),
+        ("Resource Limits", env["RESOURCE_LIMITS_DESCRIPTION"], "grey"),
         ("Gateway Service", env["GATEWAY_REPLICAS"]),
         ("Order Service", env["ORDER_REPLICAS"]),
         ("Stock Service", env["STOCK_REPLICAS"]),
@@ -239,11 +267,11 @@ def main() -> None:
 
         env = env_for_mode(mode)
 
+        layout = ask_three("Replicas?", "Compose Defaults", "Custom", "Optimized 50 CPUs")
+        _apply_replicas(env, layout)
+
         limits = ask_three("Resource Limits?", "No Limits", "Shared Core", "One Core Per Container")
         _apply_resource_limits(env, limits)
-
-        layout = ask("Replicas?", "Compose Defaults", "Custom")
-        _apply_replicas(env, layout)
 
         tune = ask("Pool And Stream Batch?", "Project Defaults", "Custom")
         _apply_stream_tuning(env, tune)
