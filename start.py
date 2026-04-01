@@ -71,6 +71,16 @@ def ask(prompt: str, a: str, b: str) -> int:
         print(_red("Use 1 Or 2."))
 
 
+def ask_three(prompt: str, a: str, b: str, c: str) -> int:
+    while True:
+        s = input(
+            f"{_cy(prompt)} {_dim('1=')}{a} {_dim('2=')}{b} {_dim('3=')}{c} {_cy('>')} "
+        ).strip()
+        if s in ("1", "2", "3"):
+            return int(s)
+        print(_red("Use 1, 2, Or 3."))
+
+
 _SUMMARY_INDENT = "  "
 
 
@@ -109,17 +119,75 @@ def env_for_mode(mode: str) -> dict:
 
 
 def _apply_replicas(env: dict, layout: int) -> None:
-    # matches docker-compose: gateway :-1, order/stock/payment :-2
     if layout == 1:
+        # TODO: Code duplication with the defaults in docker-compose.yml
         env["GATEWAY_REPLICAS"] = "1"
         env["ORDER_REPLICAS"] = "2"
         env["STOCK_REPLICAS"] = "2"
         env["PAYMENT_REPLICAS"] = "2"
+    elif layout == 2:
+        # We have 50 CPUs at our disposal
+        # Fixed containers (12 total): TODO: Adjust this as necessary
+        #   nginx, redis-order, redis-stock, redis-payment, redis-bus,
+        #   redis-order-replica, redis-stock-replica, redis-payment-replica,
+        #   redis-bus-replica, sentinel-1, sentinel-2, sentinel-3
+        # Remaining 38 CPUs for scalable services
+        # TODO: Tune these values to get better performance
+        # TODO: Each service replica should have its own DB cluster, so this would need to be
+        # adjusted once we fix that.
+        env["GATEWAY_REPLICAS"] = "4"
+        env["ORDER_REPLICAS"] = "10"
+        env["STOCK_REPLICAS"] = "12"
+        env["PAYMENT_REPLICAS"] = "12"
+        
     else:
         env["GATEWAY_REPLICAS"] = str(ask_int("Gateway Service", 1, scoped=True))
         env["ORDER_REPLICAS"] = str(ask_int("Order Service", 2, scoped=True))
         env["STOCK_REPLICAS"] = str(ask_int("Stock Service", 2, scoped=True))
         env["PAYMENT_REPLICAS"] = str(ask_int("Payment Service", 2, scoped=True))
+
+def _apply_resource_limits(env: dict, limits: int) -> None:
+    fixed_containers = [
+        "NGINX",
+        "REDIS_ORDER",
+        "REDIS_STOCK",
+        "REDIS_PAYMENT",
+        "REDIS_BUS",
+        "REDIS_ORDER_REPLICA",
+        "REDIS_STOCK_REPLICA",
+        "REDIS_PAYMENT_REPLICA",
+        "REDIS_BUS_REPLICA",
+        "SENTINEL_1",
+        "SENTINEL_2",
+        "SENTINEL_3",
+    ]
+    replicated_containers = [
+        "GATEWAY",
+        "ORDER",
+        "STOCK",
+        "PAYMENT",
+    ]
+    if limits == 1:
+        env["RESOURCE_LIMITS_DESCRIPTION"] = "No Limits"
+        env[f"CPU_LIMIT"] = "0"
+        for container in fixed_containers + replicated_containers:
+            env[f"{container}_CPUSET"] = ""
+    elif limits == 2:
+        env["RESOURCE_LIMITS_DESCRIPTION"] = "Shared Core"
+        env[f"CPU_LIMIT"] = "0"
+        for container in fixed_containers + replicated_containers:
+            env[f"{container}_CPUSET"] = "0"
+    else:
+        env["RESOURCE_LIMITS_DESCRIPTION"] = "One Core Per Container"
+        env[f"CPU_LIMIT"] = "1"
+        curr_cpu = 0
+        for fixed_container in fixed_containers:
+            env[f"{fixed_container}_CPUSET"] = str(curr_cpu)
+            curr_cpu += 1
+        for replicated_container in replicated_containers:
+            num_replicas = int(env[f"{replicated_container}_REPLICAS"])
+            env[f"{replicated_container}_CPUSET"] = f"{curr_cpu}-{curr_cpu + num_replicas - 1}" # - 1 at the end, since both ranges are inclusive
+            curr_cpu += num_replicas
 
 
 def _apply_stream_tuning(env: dict, tune: int) -> None:
@@ -152,6 +220,7 @@ def _print_summary_rows(
 def _summary_base_rows(env: dict) -> list:
     return [
         ("Transaction Mode", env["TRANSACTION_MODE"], "grey"),
+        ("Resource Limits", env["RESOURCE_LIMITS_DESCRIPTION"], "grey"),
         ("Gateway Service", env["GATEWAY_REPLICAS"]),
         ("Order Service", env["ORDER_REPLICAS"]),
         ("Stock Service", env["STOCK_REPLICAS"]),
@@ -178,10 +247,13 @@ def main() -> None:
 
         env = env_for_mode(mode)
 
-        layout = ask("Replicas?", "Compose Defaults", "Custom")
+        layout = ask_three("Replicas?", "Defaults", "Optimized 50 CPUs", "Custom")
         _apply_replicas(env, layout)
 
-        tune = ask("Pool And Stream Batch?", "Project Defaults", "Custom")
+        limits = ask_three("Resource Limits?", "No Limits", "Shared Core", "One Core Per Container")
+        _apply_resource_limits(env, limits)
+
+        tune = ask("Pool And Stream Batch?", "Defaults", "Custom")
         _apply_stream_tuning(env, tune)
 
         if action == 1:

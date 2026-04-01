@@ -2,12 +2,22 @@
 
 Aditya Patil · Danil Vorotilov · Pedro Gomes Moreira · Ruben Van Seventer · Veselin Mitev
 
-## How To Run
+## Deployment
 
 ### Requirements
 
-- Docker + Docker Compose
-- Python 3.9+ On The Host For `start.py` And `test/run.py` (Both Exit With A Clear Message If Older); Docker Service Images Use Python 3.12
+- Docker v25+
+- Docker Compose v5+
+- Docker Buildx v33+
+- Python v3.9+
+
+Verify if you have the required versions with:
+```bash
+docker --version
+docker compose version
+docker buildx version
+python --version
+```
 
 ### Start
 
@@ -17,44 +27,88 @@ python start.py
 
 The Launcher Asks Five Short Questions and Handles Everything Else.
 
-
-| Prompt                             | Options                   | What It Does                                                                  |
-| ---------------------------------- | ------------------------- | ----------------------------------------------------------------------------- |
-| **Mode?**                          | TPC / SAGA                | Selects the Transaction Protocol                                              |
-| **Action?**                        | Start Stack / Run Tests   | Starts the System, or Builds and Runs the Full Benchmark                      |
-| **Replicas?**                      | Compose Defaults / Custom | Defaults: 1 Gateway, 2 of Each Service. Custom Lets You Set Each Individually |
-| **Pool And Stream Batch?**         | Project Defaults / Custom | Tunes the Redis Connection Pool Size and Stream Batch Size                    |
-| **Skip Build?** *(Run Tests Only)* | Yes / No                  | Skips `docker compose build` if Images Are Already Up to Date                 |
-
-
-After the Benchmark Finishes the Stack Is Torn Down Automatically.
+| Prompt | Options | What It Does |
+| --- | --- | ---- |
+| **Mode?** | TPC / SAGA | Selects the Transaction Protocol |
+| **Action?** | Start Stack / Run Tests | Builds and starts the system  or runs our [full test suite (additioanl requirements apply)](#test-suite). |
+| **Replicas?** | Defaults / Optimized 50 CPUs / Custom | How many replicas of the different scalable services should we have? The first options are presets, while the last allows you to tune the individually tune the number of replicas for each service. |
+| **Resource Limits?** | No Limits / Shared Core / One Core Per Container | Limits for the CPU resources available to the docker containers. Shared core means that all containers will share the same dedicated core. One per container means that each container will have its own dedicated core; this requires that the host has enough cores. |
+| **Pool And Stream Batch?** | Defaults / Custom | Tunes the Redis Connection Pool Size and Stream Batch Size |
+| **Skip Build?** *(Run Tests Only)* | Yes / No | Skips `docker compose build` if Images Are Already Up to Date |
 
 ### Stop
 
+After the benchmark finishes the stack is torn down automatically. On startup, `start.py` will stop the currently running instance of this compose stack, if any. In `Start Stack` mode, the the `start.py` script will exit once the stack is fully started, thus, the stack will continue running.  You can stop it with:
+
 ```bash
-docker compose down -v
+docker compose down -v --remove-orphans
 ```
 
-## Configuration
+### Manual Deployment
+If you'd like to start the system manually, you must first ensure that you have the [required environment variables set](#configuration). Then, you can build and start the compose stack with:
+
+```bash
+docker compose up --build -d --wait
+```
+
+#### Configuration
 
 `start.py` Sets All Variables Interactively. For Headless or CI Runs, Export Them as Environment Variables or Place a `.env` File at the Project Root — Docker Compose Picks It Up Automatically.
 
 
-| Variable                | Default                   | Description                                                                                              |
-| ----------------------- | ------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `TRANSACTION_MODE`      | `SAGA`                    | Protocol to Use. `TPC` for Two-Phase Commit, `SAGA` for Event-Driven Compensation.                       |
-| `NGINX_CONF`            | `gateway_nginx_saga.conf` | Nginx Config File. Must Match the Selected `TRANSACTION_MODE`.                                           |
-| `GATEWAY_REPLICAS`      | `1`                       | Number of API Gateway Containers.                                                                        |
-| `ORDER_REPLICAS`        | `2`                       | Number of Order Service Containers.                                                                      |
-| `STOCK_REPLICAS`        | `2`                       | Number of Stock Service Containers.                                                                      |
-| `PAYMENT_REPLICAS`      | `2`                       | Number of Payment Service Containers.                                                                    |
-| `REDIS_MAX_CONNECTIONS` | `6000`                    | Connection Pool Size Per Redis Pool Per Service Worker.                                                  |
-| `STREAM_BATCH_SIZE`     | `100`                     | Messages Fetched Per `XREADGROUP` Call. All Messages in a Batch Are Processed Concurrently via `gevent`. |
-| `DDM_SKIP_BUILD`        | *(unset)*                 | Set to `1` to Skip `docker compose build` When Running the Test Suite Headlessly.                        |
-| `DDM_NO_RESTART`        | *(unset)*                 | Set to `1` to Skip `docker compose down/up` and Reuse the Running Stack.                                 |
+| Variable | Default | Description |
+| --- | --- | --- |
+| `TRANSACTION_MODE` | `SAGA` | Protocol to Use. `TPC` for Two-Phase Commit, `SAGA` for Event-Driven Compensation. |
+| `NGINX_CONF` | `gateway_nginx_saga.conf` | Nginx Config File. Must Match the Selected `TRANSACTION_MODE`. |
+| `GATEWAY_REPLICAS` | `1` | Number of API Gateway Containers. |
+| `ORDER_REPLICAS` | `2` | Number of Order Service Containers. |
+| `STOCK_REPLICAS` | `2` | Number of Stock Service Containers. |
+| `PAYMENT_REPLICAS` | `2` | Number of Payment Service Containers. |
+| `REDIS_MAX_CONNECTIONS` | `6000` | Connection Pool Size Per Redis Pool Per Service Worker. |
+| `STREAM_BATCH_SIZE` | `100` | Messages Fetched Per `XREADGROUP` Call. All Messages in a Batch Are Processed Concurrently via `gevent`. |
+| `DDM_SKIP_BUILD` | *(unset)* | Set to `1` to Skip `docker compose build` When Running the Test Suite Headlessly. |
+| `DDM_NO_RESTART` | *(unset)* | Set to `1` to Skip `docker compose down/up` and Reuse the Running Stack. |
+| `CPU_LIMIT` | `0` | When set to `0`, the containers won't be limited by the CPU time that they use. When set to `1`, each container will be limited to using no more than 1 (potentially virtual) CPU core worth of CPU time. Corresponds to the `services/cpus` docker compose attribute. |
+| `*_CPUSET` (In particular, `*` can be replaced by: `GATEWAY`, `ORDER`, `STOCK`, `PAYMENT`, `NGINX`, `REDIS_ORDER`, `REDIS_STOCK`, `REDIS_PAYMENT`, `REDIS_BUS`, `REDIS_ORDER_REPLICA`, `REDIS_STOCK_REPLICA`, `REDIS_PAYMENT_REPLICA`, `REDIS_BUS_REPLICA`, `SENTINEL_1`, `SENTINEL_2`, `SENTINEL_3`) | *(unset)* |  These are the (potentially virtual) CPU cores that each of the containers will be used. For containers that are replicated via Docker's `deploy` attribute (`GATEWAY`, `ORDER`, `STOCK`, `PAYMENT`), these cores will be used for all replicas cumulatively. Leaving it unset, means the container won't be limited to any specific cores. Otherwise you can give a list of 1 or more cores (`1`, `2,3`) or an inclusive range (`2-5`). |
 
 
-## The Orchestrator
+## Benchmarking
+Use the [provided benchmarking repo](https://github.com/delftdata/wdm-project-benchmark/tree/master). There are good instructions there, but in short:
+
+```sh
+git clone https://github.com/delftdata/wdm-project-benchmark.git
+cd wdm-project-benchmark
+
+python -m venv venv
+
+# Activate with
+source venv/bin/activate 
+# Or on Windows:
+.\venv\Scripts\Activate.ps1 
+
+pip install -r requirements.txt
+```
+
+You need to then have the system up and running on the same host.
+
+Check for consistency correctness with:
+```sh
+cd consistency-test
+python run_consistency_test.py
+```
+
+Stress test with:
+```
+cd stress-test
+python init_orders.py
+locust -f locustfile.py --host="localhost" --users=1000 --spawn-rate=100 --autostart --processes=2
+```
+Adjust the locust parameters as needed (you may also exclude `--processes` as applicable). You can monitor the benchmarking from the [Locust web UI](http://localhost:8089/?tab=charts).
+
+Use `docker stats --no-stream` to monitor the resource usage of the system if you need that.
+
+## Design
+### The Orchestrator
 
 Both Protocols Are Driven by a Single Generic Workflow Engine in `common/orchestrator.py`. It Knows Nothing About Orders or Payments — It Only Knows How to Run a List of Python Functions in Order, Write Its Position to Redis Before Each Step, and Run Them in Reverse If Something Goes Wrong.
 
@@ -72,13 +126,23 @@ The Test Suite Lives in `test/`. It Is a Standalone CLI — No External Test Fra
 
 ### Run
 
-Run via `python start.py` → Select **Run Tests**. The Launcher Builds the Stack, Runs All Suites in Order, and Tears Everything Down When Finished.
-
-Install the Python Dependencies Beforehand If You Haven't Already:
+We require that the Python packages in `requirements.txt` are installed. Best to do so in a virtual environment like so:
 
 ```bash
+python -m venv venv
+
+# Activate with
+source venv/bin/activate 
+# Or on Windows:
+.\venv\Scripts\Activate.ps1 
+
 pip install -r requirements.txt
+
+# You can deactivate with:
+deactivate
 ```
+
+Run via `python start.py` → Select **Run Tests**. The Launcher Builds the Stack, Runs All Suites in Order, and Tears Everything Down When Finished.
 
 ### Suite Order
 
@@ -86,9 +150,9 @@ pip install -r requirements.txt
 2. TPC or SAGA — Protocol-Specific Correctness (Driven by `TRANSACTION_MODE`)
 3. Replication — Sentinel Failover and Data Durability (Always Runs Last; It Changes Cluster Topology)
 
-## Test Cases
+### Test Cases
 
-### Common Suite
+#### Common Suite
 
 
 | Test                                   | What It Verifies                                                                                                 |
@@ -124,7 +188,7 @@ pip install -r requirements.txt
 | **Redis Bus Restart Recovery**         | Restarting the shared message bus does not prevent subsequent checkouts from completing.                         |
 
 
-### TPC Suite
+#### TPC Suite
 
 
 | Test                           | What It Verifies                                                                                                     |
@@ -143,7 +207,7 @@ pip install -r requirements.txt
 | **Coordinator Crash Recovery** | A stuck in-doubt workflow injected directly into the log is deterministically resolved by `recovery_tpc` on restart. |
 
 
-### SAGA Suite
+#### SAGA Suite
 
 
 | Test                                 | What It Verifies                                                                                                          |
@@ -158,7 +222,7 @@ pip install -r requirements.txt
 | **Pending-Message Re-Delivery**      | A stream message left unACKed due to a crash is re-delivered and processed correctly after restart.                       |
 
 
-### Replication Suite
+#### Replication Suite
 
 
 | Test                                         | What It Verifies                                                                                                                      |

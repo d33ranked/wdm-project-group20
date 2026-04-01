@@ -3,5 +3,8 @@
 __pycache__/
 test/__pycache__/
 .venv
+venv
 .vscode
 **/__pycache__/**
+*_.txt
+logs
