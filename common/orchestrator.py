@@ -209,15 +209,18 @@ class Orchestrator:
 
     def _execute_forward(self, workflow, wf_id, r, step_idx, ctx) -> tuple:
         for idx in range(step_idx, len(workflow.steps)):
-            r.hset(f"{self._PREFIX}{wf_id}", "step", str(idx))
+            r.hset(
+                f"{self._PREFIX}{wf_id}",
+                mapping={"step": str(idx), "status": self.WAITING},
+            )
             try:
                 result = workflow.steps[idx](ctx)
+                r.hset(f"{self._PREFIX}{wf_id}", "status", self.RUNNING)
                 if result:
                     ctx.update(result)
                     r.hset(f"{self._PREFIX}{wf_id}", "context", json.dumps(ctx))
 
             except _AsyncSuspend:
-                r.hset(f"{self._PREFIX}{wf_id}", "status", self.WAITING)
                 return self.WAITING, ""
 
             except StepFailed as exc:
@@ -249,18 +252,22 @@ class Orchestrator:
         for idx in range(failed_at - 1, -1, -1):
             if idx >= len(workflow.compensation):
                 continue
-            r.hset(f"{self._PREFIX}{wf_id}", "comp_step", str(idx))
+            r.hset(
+                f"{self._PREFIX}{wf_id}",
+                mapping={"comp_step": str(idx), "status": self.WAITING_COMP},
+            )
             try:
                 workflow.compensation[idx](ctx)
+                r.hset(f"{self._PREFIX}{wf_id}", "status", self.COMPENSATING)
 
             except _AsyncSuspend:
-                r.hset(f"{self._PREFIX}{wf_id}", "status", self.WAITING_COMP)
                 return self.WAITING_COMP, ctx.get("_error", "")
 
             except Exception as exc:
                 logger.error(
                     "Compensation step %d failed for wf %s: %s", idx, wf_id, exc
                 )
+                r.hset(f"{self._PREFIX}{wf_id}", "status", self.COMPENSATING)
 
         r.hset(f"{self._PREFIX}{wf_id}", "status", self.FAILED)
         if workflow.on_failed:
