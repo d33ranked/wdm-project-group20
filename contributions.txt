@@ -32,5 +32,6 @@ Integration happened through shared reviews and the main branch.
 - Docker Compose — Multi-Replica Services, Depends-On And Health Wiring
 
 ### Veselin Mitev
-- Profiling — Instrumentation Runs And Data Collection
-- Replication — Exploratory Sentinel Failover And Service Scale-Out Drafts
+- Replication -- Implemented the first version of replcation and automatic failover in the old PostgreSQL database, using Patroni and etcd as a DRDBMS. This was later replaced with Redis, so the code didn't survive.
+- Resource Controls -- Implemented CPU resource limitations via our start script and docker compose file, in order to test how well our system scales.
+- Cloud Deployment & Benchmarking -- As needed, deploys the system on a 96-(physical)-core AWS EC2 instance, and benchmarks using the Locust.
