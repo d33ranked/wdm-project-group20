@@ -20,9 +20,9 @@ Integration happened through shared reviews and the main branch.
 
 ### Pedro Gomes Moreira
 - Benchmarking Suite — Scenarios, Repeatability, Load Shape (Shared Equally With Aditya)
-- Common Suite — Mode-Agnostic Correctness, Durability, Concurrency
-- SAGA Suite — SAGA Protocol Test Coverage
-- SAGA — Participants, Compensation, Stream-Side Behaviour
+- TPC Suite — TPC Protocol Test Coverage: Fault Tolerance
+- SAGA Suite — SAGA Protocol Test Coverage: Fault Tolerance
+- Code reviews, contributions in meetings
 
 ### Ruben Van Seventer
 - Orchestrator — Suspend, Resume, Fail Semantics, Compensation Ordering (Shared Equally With Aditya)
