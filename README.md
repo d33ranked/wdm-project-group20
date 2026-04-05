@@ -120,6 +120,9 @@ Both Protocols Are Driven by a Single Generic Workflow Engine in `common/orchest
 
 **Recovery.** On Every Startup the Engine Scans Redis for Workflow Instances That Never Reached `completed` or `failed`, Reads Their Stored Position, and Continues From Exactly Where They Stopped.
 
+**Architecture of the Orchestrator**
+![Orchestrator Architecture](/architecture/orchastrator_architecture.png)
+
 ## Test Suite
 
 The Test Suite Lives in `test/`. It Is a Standalone CLI — No External Test Framework. It Builds the Stack, Runs All Cases in Order, and Prints a Pass/Fail Report.
