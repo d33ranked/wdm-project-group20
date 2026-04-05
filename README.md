@@ -31,7 +31,7 @@ The Launcher Asks Five Short Questions and Handles Everything Else.
 | --- | --- | ---- |
 | **Mode?** | TPC / SAGA | Selects the Transaction Protocol |
 | **Action?** | Start Stack / Run Tests | Builds and starts the system  or runs our [full test suite (additioanl requirements apply)](#test-suite). |
-| **Replicas?** | Defaults / Optimized 50 CPUs / Custom | How many replicas of the different scalable services should we have? The first options are presets, while the last allows you to tune the individually tune the number of replicas for each service. |
+| **Replicas?** | Defaults / Optimized for 1 CPU / Optimized for 50 CPUs / Optimized for 90 CPUs / Custom | How many replicas of the different scalable services should we have? The first options are presets, while the last allows you to tune the individually tune the number of replicas for each service. |
 | **Resource Limits?** | No Limits / Shared Core / One Core Per Container | Limits for the CPU resources available to the docker containers. Shared core means that all containers will share the same dedicated core. One per container means that each container will have its own dedicated core; this requires that the host has enough cores. |
 | **Pool And Stream Batch?** | Defaults / Custom | Tunes the Redis Connection Pool Size and Stream Batch Size |
 | **Skip Build?** *(Run Tests Only)* | Yes / No | Skips `docker compose build` if Images Are Already Up to Date |
@@ -101,9 +101,9 @@ Stress test with:
 ```
 cd stress-test
 python init_orders.py
-locust -f locustfile.py --host="localhost" --users=1000 --spawn-rate=100 --autostart --processes=2
+taskset -c 50-51 locust -f locustfile.py --host="localhost" --users=1000 --spawn-rate=100 --autostart --processes=2
 ```
-Adjust the locust parameters as needed (you may also exclude `--processes` as applicable). You can monitor the benchmarking from the [Locust web UI](http://localhost:8089/?tab=charts).
+Adjust the locust parameters as needed (you may also exclude `taskset -c` and `--processes` as applicable). You can monitor the benchmarking from the [Locust web UI](http://localhost:8089/?tab=charts).
 
 Use `docker stats --no-stream` to monitor the resource usage of the system if you need that.
 

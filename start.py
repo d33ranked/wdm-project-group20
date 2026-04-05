@@ -61,24 +61,15 @@ def _yl(t: str) -> str:
     return _s("33", t)
 
 
-def ask(prompt: str, a: str, b: str) -> int:
+def ask(prompt: str, *options: str) -> int:
     while True:
-        s = input(
-            f"{_cy(prompt)} {_dim('1=')}{a} {_dim('2=')}{b} {_cy('>')} "
-        ).strip()
-        if s in ("1", "2"):
+        parts = [f"{_dim(str(i)+'=')}{opt}" for i, opt in enumerate(options, start=1)]
+        choices = ", ".join(str(i) for i in range(1, len(options) + 1))
+        input_line = f"{_cy(prompt)} {' '.join(parts)} {_cy('>')} "
+        s = input(input_line).strip()
+        if s in choices:
             return int(s)
-        print(_red("Use 1 Or 2."))
-
-
-def ask_three(prompt: str, a: str, b: str, c: str) -> int:
-    while True:
-        s = input(
-            f"{_cy(prompt)} {_dim('1=')}{a} {_dim('2=')}{b} {_dim('3=')}{c} {_cy('>')} "
-        ).strip()
-        if s in ("1", "2", "3"):
-            return int(s)
-        print(_red("Use 1, 2, Or 3."))
+        print(_red(f"Use {' Or '.join(choices.split(', '))}.") if len(options) <= 3 else _red(f"Use 1-{len(options)}."))
 
 
 _SUMMARY_INDENT = "  "
@@ -126,25 +117,30 @@ def _apply_replicas(env: dict, layout: int) -> None:
         env["STOCK_REPLICAS"] = "2"
         env["PAYMENT_REPLICAS"] = "2"
     elif layout == 2:
-        # We have 50 CPUs at our disposal
-        # Fixed containers (12 total): TODO: Adjust this as necessary
-        #   nginx, redis-order, redis-stock, redis-payment, redis-bus,
-        #   redis-order-replica, redis-stock-replica, redis-payment-replica,
-        #   redis-bus-replica, sentinel-1, sentinel-2, sentinel-3
-        # Remaining 38 CPUs for scalable services
-        # TODO: Tune these values to get better performance
-        # TODO: Each service replica should have its own DB cluster, so this would need to be
-        # adjusted once we fix that.
-        env["GATEWAY_REPLICAS"] = "4"
-        env["ORDER_REPLICAS"] = "10"
-        env["STOCK_REPLICAS"] = "12"
-        env["PAYMENT_REPLICAS"] = "12"
-        
-    else:
         env["GATEWAY_REPLICAS"] = str(ask_int("Gateway Service", 1, scoped=True))
         env["ORDER_REPLICAS"] = str(ask_int("Order Service", 2, scoped=True))
         env["STOCK_REPLICAS"] = str(ask_int("Stock Service", 2, scoped=True))
         env["PAYMENT_REPLICAS"] = str(ask_int("Payment Service", 2, scoped=True))
+    # Fixed containers (12 total):
+    #   nginx, redis-order, redis-stock, redis-payment, redis-bus,
+    #   redis-order-replica, redis-stock-replica, redis-payment-replica,
+    #   redis-bus-replica, sentinel-1, sentinel-2, sentinel-3
+    elif layout == 3:
+        env["GATEWAY_REPLICAS"] = "1"
+        env["ORDER_REPLICAS"] = "1"
+        env["STOCK_REPLICAS"] = "1"
+        env["PAYMENT_REPLICAS"] = "1"
+    elif layout == 4:
+        env["GATEWAY_REPLICAS"] = "4"
+        env["ORDER_REPLICAS"] = "14"
+        env["STOCK_REPLICAS"] = "10"
+        env["PAYMENT_REPLICAS"] = "10"
+    else:
+        env["GATEWAY_REPLICAS"] = "10"
+        env["ORDER_REPLICAS"] = "35"
+        env["STOCK_REPLICAS"] = "16"
+        env["PAYMENT_REPLICAS"] = "16"
+
 
 def _apply_resource_limits(env: dict, limits: int) -> None:
     fixed_containers = [
@@ -247,10 +243,10 @@ def main() -> None:
 
         env = env_for_mode(mode)
 
-        layout = ask_three("Replicas?", "Defaults", "Optimized 50 CPUs", "Custom")
+        layout = ask("Replicas?", "Defaults", "Custom", "Optimized for 1 CPU", "Optimized for 50 CPUs", "Optimized for 90 CPUs")
         _apply_replicas(env, layout)
 
-        limits = ask_three("Resource Limits?", "No Limits", "Shared Core", "One Core Per Container")
+        limits = ask("Resource Limits?", "No Limits", "Shared Core", "One Core Per Container")
         _apply_resource_limits(env, limits)
 
         tune = ask("Pool And Stream Batch?", "Defaults", "Custom")
