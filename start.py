@@ -131,15 +131,15 @@ def _apply_replicas(env: dict, layout: int) -> None:
         env["STOCK_REPLICAS"] = "1"
         env["PAYMENT_REPLICAS"] = "1"
     elif layout == 4:
-        env["GATEWAY_REPLICAS"] = "12"
-        env["ORDER_REPLICAS"] = "16"
-        env["STOCK_REPLICAS"] = "5"
-        env["PAYMENT_REPLICAS"] = "5"
+        env["GATEWAY_REPLICAS"] = "4"
+        env["ORDER_REPLICAS"] = "14"
+        env["STOCK_REPLICAS"] = "10"
+        env["PAYMENT_REPLICAS"] = "10"
     else:
-        env["GATEWAY_REPLICAS"] = "26"
-        env["ORDER_REPLICAS"] = "30"
-        env["STOCK_REPLICAS"] = "11"
-        env["PAYMENT_REPLICAS"] = "11"
+        env["GATEWAY_REPLICAS"] = "10"
+        env["ORDER_REPLICAS"] = "35"
+        env["STOCK_REPLICAS"] = "16"
+        env["PAYMENT_REPLICAS"] = "16"
 
 
 def _apply_resource_limits(env: dict, limits: int) -> None:

@@ -101,9 +101,9 @@ Stress test with:
 ```
 cd stress-test
 python init_orders.py
-locust -f locustfile.py --host="localhost" --users=1000 --spawn-rate=100 --autostart --processes=2
+taskset -c 50-51 locust -f locustfile.py --host="localhost" --users=1000 --spawn-rate=100 --autostart --processes=2
 ```
-Adjust the locust parameters as needed (you may also exclude `--processes` as applicable). You can monitor the benchmarking from the [Locust web UI](http://localhost:8089/?tab=charts).
+Adjust the locust parameters as needed (you may also exclude `taskset -c` and `--processes` as applicable). You can monitor the benchmarking from the [Locust web UI](http://localhost:8089/?tab=charts).
 
 Use `docker stats --no-stream` to monitor the resource usage of the system if you need that.
 
